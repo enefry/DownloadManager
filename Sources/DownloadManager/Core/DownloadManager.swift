@@ -6,17 +6,136 @@ import Foundation
 public final class DownloadManager: DownloadManagerProtocol {
     // MARK: - 公开属性
 
-    internal var _activeTaskCountSubject = CurrentValueSubject<Int, Never>(0)
     public lazy var activeTaskCountPublisher: AnyPublisher<Int, Never> = _activeTaskCountSubject.eraseToAnyPublisher()
 
-    // 这个是一个线程安全容器，接口和 array对齐
-    public var tasks: ConcurrencyCollection.ConcurrentArray<any DownloadTaskProtocol> = ConcurrentArray()
+    public var allTasks: [any DownloadTaskProtocol] { tasks.values }
 
-    public var _activeTaskCount = ManagedAtomic<Int>(0)
-    public var activeTaskCount: Int {
-        _activeTaskCount.load(ordering: .relaxed)
+    public var activeTaskCount: Int { _activeTaskCount.load(ordering: .relaxed) }
+
+    public var maxConcurrentDownloads: Int {
+        get {
+            configuration.maxConcurrentDownloads
+        }
+        set {
+            configuration.maxConcurrentDownloads = newValue
+            checkAndScheduleDownload()
+        }
     }
 
+    public func pause(task: any DownloadTaskProtocol) {
+        pause(withIdentifier: task.identifier)
+    }
+
+    public func pause(withIdentifier identifier: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
+                return
+            }
+            // 暂停后，会出发状态更新，状态更新后，会出发队列新下载
+            task.pause()
+            // 检查是否可以开始新的下载
+            self.checkAndScheduleDownload()
+        }
+    }
+
+    public func resume(task: any DownloadTaskProtocol) {
+        resume(withIdentifier: task.identifier)
+    }
+
+    public func resume(withIdentifier identifier: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
+                return
+            }
+            // 恢复下载，将任务状态设置为等待中，然后检查是否可以开始下载
+            task.resume()
+            self.checkAndScheduleDownload()
+        }
+    }
+
+    public func cancel(task: any DownloadTaskProtocol) {
+        cancel(withIdentifier: task.identifier)
+    }
+
+    public func cancel(withIdentifier identifier: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
+                return
+            }
+            // 取消下载任务
+            task.cancel()
+            // 检查是否可以开始新的下载
+            self.checkAndScheduleDownload()
+        }
+    }
+
+    public func remove(task: any DownloadTaskProtocol) {
+        remove(withIdentifier: task.identifier)
+    }
+
+    public func remove(withIdentifier identifier: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
+                return
+            }
+            // 如果任务正在下载，先取消
+            if task.state == .downloading {
+                task.cancel()
+            }
+            // 从任务列表中移除
+            self.removeTask(withIdentifier: identifier)
+            // 检查是否可以开始新的下载
+            self.checkAndScheduleDownload()
+        }
+    }
+
+    public func insert(task: any DownloadTaskProtocol) {
+        insert(withIdentifier: task.identifier)
+    }
+
+    public func insert(withIdentifier identifier: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
+                return
+            }
+            // 将新任务添加到队列开头
+            self.tasks.safeWrite { queue in
+                queue.removeAll(where: { $0.identifier == task.identifier })
+                queue.insert(task, at: 0)
+            }
+
+            // 如果任务数量超过最大并发数，需要暂停最后一个任务
+            if self.activeTaskCount >= self.maxConcurrentDownloads {
+                // 找到最后一个正在下载的任务并暂停
+                for task in self.tasks.values.reversed() {
+                    if let downloadTask = task as? DownloadTask,
+                       downloadTask.state == .downloading {
+                        downloadTask.pause()
+                        break
+                    }
+                }
+            }
+            // 开始新任务的下载
+            self.startDownload(task)
+            // 持久化保存
+            self.persistenceManager.saveTasks(self.tasks.values.compactMap { $0 as? DownloadTask })
+        }
+    }
+
+    // MARK: - 私有属性
+
+    // 这个是一个线程安全容器，接口和 array对齐
+    private var tasks: ConcurrencyCollection.ConcurrentArray<any DownloadTaskProtocol> = ConcurrentArray()
+
+    /// 当前有效任务数
+    private var _activeTaskCount = ManagedAtomic<Int>(0)
+    /// 事件发送
+    private var _activeTaskCountSubject = CurrentValueSubject<Int, Never>(0)
     private func increaseActive() {
         let newValue = _activeTaskCount.wrappingIncrementThenLoad(
             ordering: .releasing
@@ -31,27 +150,13 @@ public final class DownloadManager: DownloadManagerProtocol {
         _activeTaskCountSubject.send(newValue)
     }
 
-    public var maxConcurrentDownloads: Int {
-        get {
-            configuration.maxConcurrentDownloads
-        }
-        set {
-            queue.async { [weak self] in
-                guard let self = self else {
-                    return
-                }
-                self.configuration.maxConcurrentDownloads = newValue
-                self.checkAndScheduleDownload()
-            }
-        }
-    }
-
-    // MARK: - 私有属性
-
+    /// 队列持久化管理器
     private var persistenceManager: DownloadPersistenceManager
+    /// 管理器配置
     private var configuration: DownloadManagerConfiguration
-    private let session: URLSession
+    /// 下载队列
     private let queue = DispatchQueue(label: "com.downloadmanager", qos: .utility)
+    private var sessionConfig: URLSessionConfiguration
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - 初始化
@@ -60,10 +165,16 @@ public final class DownloadManager: DownloadManagerProtocol {
         self.configuration = configuration
         persistenceManager = DownloadPersistenceManager()
 
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = 30
-        sessionConfig.timeoutIntervalForResource = 300
-        session = URLSession(configuration: sessionConfig)
+        sessionConfig = URLSessionConfiguration.default
+        sessionConfig.allowsCellularAccess = configuration.allowCellularDownloads
+        sessionConfig.allowsExpensiveNetworkAccess = !configuration.autoPauseOnCellular
+        sessionConfig.connectionProxyDictionary = configuration.connectionProxyDictionary
+        if let timeoutIntervalForResource = configuration.timeoutIntervalForResource {
+            sessionConfig.timeoutIntervalForResource = timeoutIntervalForResource
+        }
+        if let timeoutIntervalForRequest = configuration.timeoutIntervalForRequest {
+            sessionConfig.timeoutIntervalForRequest = timeoutIntervalForRequest
+        }
 
         // 从持久化存储加载任务
         loadPersistedTasks()
@@ -108,8 +219,7 @@ public final class DownloadManager: DownloadManagerProtocol {
             url: url,
             destinationURL: destination,
             identifier: identifier,
-            configuration: taskConfig,
-            session: session
+            configuration: taskConfig
         )
 
         // 保存任务到队列
@@ -139,7 +249,8 @@ public final class DownloadManager: DownloadManagerProtocol {
                 chunkSize: task.taskConfigure.chunkSize,
                 maxConcurrentChunks: task.taskConfigure.maxConcurrentChunks,
                 timeoutInterval: task.taskConfigure.timeoutInterval,
-                taskConfigure: task.taskConfigure
+                taskConfigure: task.taskConfigure,
+                sessionConfigure: self.sessionConfig
             )
 
             let chunkManager = ChunkDownloadManager(
@@ -325,22 +436,6 @@ extension DownloadManager: ChunkDownloadManagerDelegate {
             }
         }
     }
-
-//    private func scheduleNextDownload() {
-//        queue.async { [weak self] in
-//            guard let self = self else { return }
-//
-//            // 查找等待中的任务
-//            if let waitingTask = self.tasks.values.first(where: { task in
-//                if let downloadTask = task as? DownloadTask {
-//                    return downloadTask.state == .waiting
-//                }
-//                return false
-//            }) as? DownloadTask {
-//                self.startDownload(waitingTask)
-//            }
-//        }
-//    }
 
     // 检查下载并发数量，暂停或者开始新的下载任务
     private func checkAndScheduleDownload() {

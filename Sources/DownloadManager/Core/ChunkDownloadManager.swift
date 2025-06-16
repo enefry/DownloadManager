@@ -39,12 +39,13 @@ public struct ChunkConfiguration {
     public let maxConcurrentChunks: Int // 最大并发分片数
     public let timeoutInterval: TimeInterval // 单个分片下载超时时间
     public let taskConfigure: DownloadTaskConfiguration // 整个下载任务的通用配置
-
-    public init(chunkSize: Int64, maxConcurrentChunks: Int, timeoutInterval: TimeInterval, taskConfigure: DownloadTaskConfiguration) {
+    public let sessionConfigure: URLSessionConfiguration
+    public init(chunkSize: Int64, maxConcurrentChunks: Int, timeoutInterval: TimeInterval, taskConfigure: DownloadTaskConfiguration, sessionConfigure: URLSessionConfiguration) {
         self.chunkSize = chunkSize
         self.maxConcurrentChunks = maxConcurrentChunks
         self.timeoutInterval = timeoutInterval
         self.taskConfigure = taskConfigure
+        self.sessionConfigure = sessionConfigure
     }
 }
 
@@ -144,14 +145,14 @@ public enum ChunkDownloadError: Error, LocalizedError {
 /// 9. **分片合并：** 当所有分片下载成功后，按顺序合并分片文件到最终目标路径，并清理临时目录。
 /// 10. **错误/取消处理：** 在下载过程中遇到错误或被取消时，清理相关资源并通知代理。
 // 移除了 URLSessionDelegate 的遵循，因为使用 AsyncBytes 模式后不再需要这些代理方法
-public final class ChunkDownloadManager: NSObject {
+public final class ChunkDownloadManager {
     // MARK: - 私有属性
 
     internal let downloadTask: any DownloadTaskProtocol // 外部传入的下载任务
     private let configuration: ChunkConfiguration // 分片下载配置
     private weak var delegate: ChunkDownloadManagerDelegate? // 代理对象
 
-    private var session: URLSession! // URLSession 实例，用于所有网络请求
+    private var session: URLSession // URLSession 实例，用于所有网络请求
     private var chunkTasks: [ChunkTask] = [] // 所有分片任务的数组
     private var activeTaskIndices: Set<Int> = [] // 当前正在下载的分片任务的索引集合
     private var tempDirectory: URL? // 分片文件保存的临时目录URL
@@ -190,6 +191,7 @@ public final class ChunkDownloadManager: NSObject {
     // 进度更新节流
     private var lastProgressUpdate: Date = Date()
     private let progressUpdateInterval: TimeInterval = 0.1 // 至少每0.1秒更新一次进度
+    private let operationQueue: OperationQueue
 
     // MARK: - 初始化
 
@@ -202,15 +204,9 @@ public final class ChunkDownloadManager: NSObject {
         self.downloadTask = downloadTask
         self.configuration = configuration
         self.delegate = delegate
-        super.init()
-
-        // 配置 URLSession
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = configuration.timeoutInterval
-        sessionConfig.timeoutIntervalForResource = configuration.timeoutInterval * 2 // 资源超时时间可以更长
-        // 可以添加自定义缓存策略等
-        // 移除了 delegate 参数，因为不再遵循 URLSessionDelegate
-        session = URLSession(configuration: sessionConfig, delegate: nil, delegateQueue: OperationQueue())
+        let operationQueue = OperationQueue()
+        self.operationQueue = operationQueue
+        session = URLSession(configuration: configuration.sessionConfigure, delegate: nil, delegateQueue: operationQueue)
     }
 
     // MARK: - 公开控制方法

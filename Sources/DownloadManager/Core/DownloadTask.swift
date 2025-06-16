@@ -40,22 +40,21 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     // MARK: - 私有属性
 
     // 内部配置
-    /// URLSession
-    internal var session: URLSession!
 
     /// 分片下载管理，每个下载任务一个分片管理器
-    private var chunkDownloadManager: ChunkDownloadManager!
+    internal var chunkDownloadManager: ChunkDownloadManager!
 
     /// 统计下载速度定时器
-    private var speedTimer: Timer?
+    internal var speedTimer: Timer?
     /// 最后下载大小
-    private var lastDownloadedBytes: Int64 = 0
+    internal var lastDownloadedBytes: Int64 = 0
 
     /// 发布者的subject
-    let stateSubject: CurrentValueSubject<DownloadState, Never>
-    let progressSubject = CurrentValueSubject<Double, Never>(0)
-    let speedSubject = CurrentValueSubject<Double, Never>(0)
+    internal let stateSubject: CurrentValueSubject<DownloadState, Never>
+    internal let progressSubject = CurrentValueSubject<Double, Never>(0)
+    internal let speedSubject = CurrentValueSubject<Double, Never>(0)
 
+    /// 订阅的句柄
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - Codable
@@ -108,12 +107,10 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
         url: URL,
         destinationURL: URL,
         identifier: String? = nil,
-        configuration: DownloadTaskConfiguration,
-        session: URLSession
+        configuration: DownloadTaskConfiguration
     ) {
         self.url = url
         self.destinationURL = destinationURL
-        self.session = session
         taskConfigure = configuration
         self.identifier = identifier ?? DownloadTask.buildIdentifier(
             url: url,
