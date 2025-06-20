@@ -35,12 +35,8 @@ public protocol DownloadManagerProtocol: AnyObject {
     func task(withURL url: URL) -> DownloadTaskProtocol?
 
     /// 删除指定ID的下载任务
-    /// - Parameter identifier: 任务ID
-    func removeTask(withIdentifier identifier: String)
-
-    /// 删除指定ID的下载任务
     /// - Parameter url: 任务的URL
-    func removeTask(withURL url: URL)
+    func remove(withURL url: URL)
 
     // MARK: - Task 操作
 
@@ -60,8 +56,9 @@ public protocol DownloadManagerProtocol: AnyObject {
 
     /// 删除任务
     func remove(task: DownloadTaskProtocol)
-    /// 删除任务
-    func remove(withIdentifier: String)
+    /// 删除指定ID的下载任务
+    /// - Parameter identifier: 任务ID
+    func remove(withIdentifier identifier: String)
 
     /// 插入优先任务
     func insert(task: DownloadTaskProtocol)
@@ -79,7 +76,7 @@ public protocol DownloadManagerProtocol: AnyObject {
     func cancelAll()
 
     /// 删除所有完成的下载任务
-    func removeAllFinish()
+    func removeAllFinished()
 
     /// 删除所有下载任务和文件
     func removeAll()

@@ -22,14 +22,27 @@ struct CRC32 {
         return table
     }()
 
-    internal static func crc32(data: Data) -> String {
-        let checksum = data.withUnsafeBytes { buffer -> UInt32 in
-            var crc: UInt32 = 0xFFFFFFFF
+    public static func crc32(data: Data) -> String {
+        var crc32 = CRC32()
+        crc32.update(data: data)
+        return String(format: "%08x", crc32.finalize())
+    }
+
+    private var seed: UInt32 = 0xFFFFFFFF
+    public init() {
+    }
+
+    public mutating func update(data: Data) {
+        var crc: UInt32 = seed
+        data.withUnsafeBytes { buffer in
             for byte in buffer {
-                crc = (crc >> 8) ^ crc32Table[Int((crc ^ UInt32(byte)) & 0xFF)]
+                crc = (crc >> 8) ^ CRC32.crc32Table[Int((crc ^ UInt32(byte)) & 0xFF)]
             }
-            return ~crc
         }
-        return String(format: "%08x", checksum)
+        seed = crc
+    }
+
+    public func finalize() -> UInt32 {
+        return ~seed
     }
 }

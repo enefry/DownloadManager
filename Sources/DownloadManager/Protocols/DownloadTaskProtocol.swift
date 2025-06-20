@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 /// 下载任务协议
-public protocol DownloadTaskProtocol: AnyObject {
+public protocol DownloadTaskProtocol: AnyObject, Sendable {
     /// 下载任务的唯一标识符
     var identifier: String { get }
 
@@ -25,7 +25,7 @@ public protocol DownloadTaskProtocol: AnyObject {
     var startTime: TimeInterval { get }
 
     /// 进度发布者
-    var progressPublisher: AnyPublisher<Double, Never> { get }
+    var progressPublisher: AnyPublisher<(Int64, Int64), Never> { get }
 
     /// 状态发布者
     var statePublisher: AnyPublisher<DownloadState, Never> { get }

@@ -23,7 +23,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     public private(set) var totalBytes: Int64 = -1
 
     /// 进度发布者
-    public var progressPublisher: AnyPublisher<Double, Never> {
+    public var progressPublisher: AnyPublisher<(Int64, Int64), Never> {
         progressSubject.eraseToAnyPublisher()
     }
 
@@ -42,7 +42,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     // 内部配置
 
     /// 分片下载管理，每个下载任务一个分片管理器
-    internal var chunkDownloadManager: ChunkDownloadManager!
+//    internal weak var chunkDownloadManager: ChunkDownloadManager?
 
     /// 统计下载速度定时器
     internal var speedTimer: Timer?
@@ -51,7 +51,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
 
     /// 发布者的subject
     internal let stateSubject: CurrentValueSubject<DownloadState, Never>
-    internal let progressSubject = CurrentValueSubject<Double, Never>(0)
+    internal let progressSubject = CurrentValueSubject<(Int64, Int64), Never>((0, 0))
     internal let speedSubject = CurrentValueSubject<Double, Never>(0)
 
     /// 订阅的句柄
@@ -118,29 +118,42 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
         )
         startTime = Date().timeIntervalSince1970
         resumeTime = 0
-        stateSubject = CurrentValueSubject<DownloadState, Never>(.waiting)
+        stateSubject = CurrentValueSubject<DownloadState, Never>(.initialed)
     }
 
     public static func buildIdentifier(url: URL, destinationURL: URL) -> String {
-        return "\(url.absoluteString)\n\(destinationURL.absoluteString)".sha256()
+        return "\(url.absoluteString)\n\(destinationURL.absoluteString)".dm_sha256()
     }
 
     // MARK: - 公开控制方法
 
-    /// 暂停下载任务
-    public func pause() {
-        chunkDownloadManager?.pause()
-    }
-
-    /// 恢复下载任务
-    public func resume() {
-        chunkDownloadManager?.resume()
-    }
-
-    /// 取消下载任务
-    public func cancel() {
-        chunkDownloadManager?.cancel()
-    }
+//
+//    public func start() {
+//        Task {
+//            await chunkDownloadManager?.start()
+//        }
+//    }
+//
+//    /// 暂停下载任务
+//    public func pause() {
+//        Task {
+//            await chunkDownloadManager?.pause()
+//        }
+//    }
+//
+//    /// 恢复下载任务
+//    public func resume() {
+//        Task {
+//            await chunkDownloadManager?.resume()
+//        }
+//    }
+//
+//    /// 取消下载任务
+//    public func cancel() {
+//        Task {
+//            await chunkDownloadManager?.cancel()
+//        }
+//    }
 
     /// 获取当前状态
     public var state: DownloadState {

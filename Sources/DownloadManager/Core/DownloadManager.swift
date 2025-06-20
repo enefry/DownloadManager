@@ -2,487 +2,1005 @@ import Atomics
 import Combine
 import ConcurrencyCollection
 import Foundation
+import LoggerProxy
 
-public final class DownloadManager: DownloadManagerProtocol {
-    // MARK: - 公开属性
+fileprivate let kLogTag = "DownloadManager"
 
-    public lazy var activeTaskCountPublisher: AnyPublisher<Int, Never> = _activeTaskCountSubject.eraseToAnyPublisher()
+// MARK: - DownloadManager State
 
-    public var allTasks: [any DownloadTaskProtocol] { tasks.values }
+/// 下载管理器的公共状态，通过 Combine 发布，供 UI 或其他模块订阅
+public final class DownloadManagerState: ObservableObject {
+    /// 当前活跃（正在下载或准备下载）的任务数量
+    @Published public private(set) var activeTaskCount: Int = 0
+    /// 所有任务的列表，包括活跃、暂停、完成、失败等所有状态
+    @Published public private(set) var allTasks: [DownloadTask] = []
+    /// 最大并发下载数
+    @Published public private(set) var maxConcurrentDownloads: Int = 4
 
-    public var activeTaskCount: Int { _activeTaskCount.load(ordering: .relaxed) }
-
-    public var maxConcurrentDownloads: Int {
-        get {
-            configuration.maxConcurrentDownloads
-        }
-        set {
-            configuration.maxConcurrentDownloads = newValue
-            checkAndScheduleDownload()
-        }
+    /// 更新活跃任务数量
+    /// - Parameter count: 新的活跃任务数量
+    func updateActiveTaskCount(_ count: Int) {
+        activeTaskCount = count
     }
 
-    public func pause(task: any DownloadTaskProtocol) {
-        pause(withIdentifier: task.identifier)
+    /// 更新所有任务列表
+    /// - Parameter tasks: 新的任务列表
+    func updateAllTasks(_ tasks: [DownloadTask]) {
+        allTasks = tasks
     }
 
-    public func pause(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self,
-                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
-                return
-            }
-            // 暂停后，会出发状态更新，状态更新后，会出发队列新下载
-            task.pause()
-            // 检查是否可以开始新的下载
-            self.checkAndScheduleDownload()
-        }
+    /// 更新最大并发下载数
+    /// - Parameter count: 新的最大并发下载数
+    func updateMaxConcurrentDownloads(_ count: Int) {
+        maxConcurrentDownloads = count
     }
+}
 
-    public func resume(task: any DownloadTaskProtocol) {
-        resume(withIdentifier: task.identifier)
-    }
+// MARK: - Internal Download Manager Actor
 
-    public func resume(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self,
-                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
-                return
-            }
-            // 恢复下载，将任务状态设置为等待中，然后检查是否可以开始下载
-            task.resume()
-            self.checkAndScheduleDownload()
-        }
-    }
+/// 下载管理器的核心逻辑，使用 Actor 隔离并发访问
+actor DownloadManagerActor {
+    // MARK: - Properties
 
-    public func cancel(task: any DownloadTaskProtocol) {
-        cancel(withIdentifier: task.identifier)
-    }
-
-    public func cancel(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self,
-                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
-                return
-            }
-            // 取消下载任务
-            task.cancel()
-            // 检查是否可以开始新的下载
-            self.checkAndScheduleDownload()
-        }
-    }
-
-    public func remove(task: any DownloadTaskProtocol) {
-        remove(withIdentifier: task.identifier)
-    }
-
-    public func remove(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self,
-                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
-                return
-            }
-            // 如果任务正在下载，先取消
-            if task.state == .downloading {
-                task.cancel()
-            }
-            // 从任务列表中移除
-            self.removeTask(withIdentifier: identifier)
-            // 检查是否可以开始新的下载
-            self.checkAndScheduleDownload()
-        }
-    }
-
-    public func insert(task: any DownloadTaskProtocol) {
-        insert(withIdentifier: task.identifier)
-    }
-
-    public func insert(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self,
-                  let task = self.task(withIdentifier: identifier) as? DownloadTask else {
-                return
-            }
-            // 将新任务添加到队列开头
-            self.tasks.safeWrite { queue in
-                queue.removeAll(where: { $0.identifier == task.identifier })
-                queue.insert(task, at: 0)
-            }
-
-            // 如果任务数量超过最大并发数，需要暂停最后一个任务
-            if self.activeTaskCount >= self.maxConcurrentDownloads {
-                // 找到最后一个正在下载的任务并暂停
-                for task in self.tasks.values.reversed() {
-                    if let downloadTask = task as? DownloadTask,
-                       downloadTask.state == .downloading {
-                        downloadTask.pause()
-                        break
-                    }
-                }
-            }
-            // 开始新任务的下载
-            self.startDownload(task)
-            // 持久化保存
-            self.persistenceManager.saveTasks(self.tasks.values.compactMap { $0 as? DownloadTask })
-        }
-    }
-
-    // MARK: - 私有属性
-
-    // 这个是一个线程安全容器，接口和 array对齐
-    private var tasks: ConcurrencyCollection.ConcurrentArray<any DownloadTaskProtocol> = ConcurrentArray()
-
-    /// 当前有效任务数
-    private var _activeTaskCount = ManagedAtomic<Int>(0)
-    /// 事件发送
-    private var _activeTaskCountSubject = CurrentValueSubject<Int, Never>(0)
-    private func increaseActive() {
-        let newValue = _activeTaskCount.wrappingIncrementThenLoad(
-            ordering: .releasing
-        )
-        _activeTaskCountSubject.send(newValue)
-    }
-
-    private func decreaseActive() {
-        let newValue = _activeTaskCount.wrappingDecrementThenLoad(
-            ordering: .releasing
-        )
-        _activeTaskCountSubject.send(newValue)
-    }
-
-    /// 队列持久化管理器
-    private var persistenceManager: DownloadPersistenceManager
-    /// 管理器配置
+    /// 存储所有下载任务的字典，以 identifier 为键
+    private var tasks: [String: DownloadTask] = [:]
+    /// 维护任务的下载顺序，例如优先级队列或添加顺序
+    private var taskOrder: [String] = []
+    /// 存储每个下载任务对应的分片下载管理器
+    private var chunkManagers: [String: ChunkDownloadManager] = [:]
+    /// 下载管理器的配置
     private var configuration: DownloadManagerConfiguration
-    /// 下载队列
-    private let queue = DispatchQueue(label: "com.downloadmanager", qos: .utility)
-    private var sessionConfig: URLSessionConfiguration
+    /// 用于持久化下载任务的管理器
+    private let persistenceManager: DownloadPersistenceManager
+    /// Combine 订阅的持有者
     private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - 初始化
+    /// 跟踪当前正在活跃下载的任务 ID 集合
+    private var activeTaskIds: Set<String> = []
 
-    public init(configuration: DownloadManagerConfiguration) {
+    /// 状态更新的闭包，用于通知 DownloadManager 更新其公共状态
+    private var stateUpdateHandler: (() async -> Void)?
+
+    // MARK: - Initialization
+
+    /// 初始化 DownloadManagerActor
+    /// - Parameter configuration: 下载管理器的配置
+    init(configuration: DownloadManagerConfiguration) {
         self.configuration = configuration
         persistenceManager = DownloadPersistenceManager()
 
-        sessionConfig = URLSessionConfiguration.default
-        sessionConfig.allowsCellularAccess = configuration.allowCellularDownloads
-        sessionConfig.allowsExpensiveNetworkAccess = !configuration.autoPauseOnCellular
-        sessionConfig.connectionProxyDictionary = configuration.connectionProxyDictionary
-        if let timeoutIntervalForResource = configuration.timeoutIntervalForResource {
-            sessionConfig.timeoutIntervalForResource = timeoutIntervalForResource
+        // 在 Actor 初始化后，异步加载持久化任务并设置网络监控
+        Task {
+            await self.loadPersistedTasks()
+            await self.setupNetworkMonitoring()
+            // 初始调度，以处理加载后的任务
+            await self.scheduleNextDownloads()
         }
-        if let timeoutIntervalForRequest = configuration.timeoutIntervalForRequest {
-            sessionConfig.timeoutIntervalForRequest = timeoutIntervalForRequest
-        }
-
-        // 从持久化存储加载任务
-        loadPersistedTasks()
-
-        // 监听网络状态变化
-        setupNetworkMonitoring()
     }
 
-    // MARK: - 私有方法
+    func set(chunkDownloadManager mgr: ChunkDownloadManager?, for identifier: String) async {
+        let last = chunkManagers[identifier]
+        if last !== mgr {
+            await last?.cancel()
+        }
+        chunkManagers[identifier] = mgr
+    }
 
-    private func loadPersistedTasks() {
+    func getChunkDownloadManager(_ identifier: String) -> ChunkDownloadManager? {
+        chunkManagers[identifier]
+    }
+
+    /// 设置状态更新处理器
+    /// - Parameter handler: 用于更新 DownloadManager 公共状态的闭包
+    func setStateUpdateHandler(_ handler: @escaping () async -> Void) {
+        stateUpdateHandler = handler
+    }
+
+    /// Deinitialization
+    deinit {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Cancelling all tasks and deinitializing DownloadManagerActor")
+
+        // 取消所有正在进行的任务
+        let chunkManagers = chunkManagers
+        Task {
+            for chunk in chunkManagers {
+                await chunk.value.cancel()
+            }
+        }
+
+        // 清理所有资源
+        self.chunkManagers.removeAll()
+        tasks.removeAll()
+        taskOrder.removeAll()
+        activeTaskIds.removeAll()
+        persistenceManager.clearTasks()
+    }
+
+    // MARK: - Private Setup Methods
+
+    /// 从持久化存储加载任务
+    private func loadPersistedTasks() async {
         let persistedTasks = persistenceManager.loadTasks()
+
         for task in persistedTasks {
-            tasks.append(task)
+            task.stateSubject.send(.initialed)
+            tasks[task.identifier] = task
+            taskOrder.append(task.identifier)
+            LoggerProxy.DLog(tag: kLogTag, msg: "Loaded persisted task: \(task.identifier) with state \(task.state)")
         }
+        LoggerProxy.DLog(tag: kLogTag, msg: "Loaded \(persistedTasks.count) persisted tasks")
+        await notifyStateUpdate() // 通知外部状态已更新
     }
 
-    private func setupNetworkMonitoring() {
-        NetworkMonitor.shared.statusPublisher.sink { [weak self] state in
-            self?.updateNetworkState(state: state)
-        }.store(in: &cancellables)
+    /// 设置网络状态监控
+    private func setupNetworkMonitoring() async {
+        NetworkMonitor.shared.statusPublisher
+            .sink { [weak self] status in
+                // 在异步上下文中处理网络状态变化
+                Task {
+                    await self?.handleNetworkStateChange(status)
+                }
+            }
+            .store(in: &cancellables)
     }
 
-    private func updateNetworkState(state: NetworkStatus) {
-        print("更新网络状态")
-        // TODO: 网络状态变化，任务变化
+    // MARK: - Public Interface Methods (Internal to Actor)
+
+    /// 获取所有任务
+    /// - Returns: 所有 DownloadTask 实例的数组
+    func getAllTasks() -> [DownloadTask] {
+        return taskOrder.compactMap { tasks[$0] }
     }
 
-    public func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?) -> any DownloadTaskProtocol {
-        let identifier = DownloadTask.buildIdentifier(
-            url: url,
-            destinationURL: destination
-        )
-        // 检查是否已存在相同identifier的任务
-        if let existingTask = task(withIdentifier: identifier) {
+    /// 获取当前活跃任务的数量
+    /// - Returns: 活跃任务的数量
+    func getActiveTaskCount() -> Int {
+        return activeTaskIds.count
+    }
+
+    /// 获取最大并发下载数
+    /// - Returns: 最大并发下载数
+    func getMaxConcurrentDownloads() -> Int {
+        return configuration.maxConcurrentDownloads
+    }
+
+    /// 设置最大并发下载数
+    /// - Parameter count: 新的最大并发下载数
+    func setMaxConcurrentDownloads(_ count: Int) async {
+        guard count > 0 else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Max concurrent downloads must be greater than 0.")
+            return
+        }
+        configuration.maxConcurrentDownloads = count
+        LoggerProxy.ILog(tag: kLogTag, msg: "Max concurrent downloads set to \(count)")
+        await scheduleNextDownloads() // 重新调度下载
+        await notifyStateUpdate()
+    }
+
+    // MARK: - Task Management
+
+    /// 创建并添加一个下载任务
+    /// - Parameters:
+    ///   - url: 下载源 URL
+    ///   - destination: 下载目标 URL
+    ///   - taskConfig: 任务的特定配置 (可选)
+    /// - Returns: 创建的 DownloadTask 实例
+    func createDownloadTask(url: URL, destination: URL, configuration taskConfig: DownloadTaskConfiguration?) async -> DownloadTask {
+        let identifier = DownloadTask.buildIdentifier(url: url, destinationURL: destination)
+
+        // 检查是否已存在
+        if let existingTask = tasks[identifier] {
+            LoggerProxy.DLog(tag: kLogTag, msg: "Task already exists: \(identifier), returning existing task.")
             return existingTask
         }
 
-        // 创建新的下载任务
-        let taskConfig = configuration ?? self.configuration.defaultTaskConfiguration
+        let config = taskConfig ?? configuration.defaultTaskConfiguration
         let task = DownloadTask(
             url: url,
             destinationURL: destination,
             identifier: identifier,
-            configuration: taskConfig
+            configuration: config
         )
 
-        // 保存任务到队列
-        tasks.append(task)
-
-        // 持久化保存
-        let currentTasks = tasks.values
-        persistenceManager.saveTasks(currentTasks.compactMap { $0 as? DownloadTask })
-
-        // 开始下载
-        startDownload(task)
-
+        await addNewTask(task)
         return task
     }
 
-    private func startDownload(_ task: DownloadTask) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-
-            // 检查并发数限制
-            if self.activeTaskCount >= self.maxConcurrentDownloads {
-                return
-            }
-
-            // 创建分片下载管理器
-            let chunkConfig = ChunkConfiguration(
-                chunkSize: task.taskConfigure.chunkSize,
-                maxConcurrentChunks: task.taskConfigure.maxConcurrentChunks,
-                timeoutInterval: task.taskConfigure.timeoutInterval,
-                taskConfigure: task.taskConfigure,
-                sessionConfigure: self.sessionConfig
-            )
-
-            let chunkManager = ChunkDownloadManager(
-                downloadTask: task,
-                configuration: chunkConfig,
-                delegate: self
-            )
-
-            // 开始下载
-            chunkManager.start()
-
-            // 更新活动任务数
-            self.increaseActive()
+    /// 暂停指定标识符的任务
+    /// - Parameter identifier: 任务的唯一标识符
+    func pauseTask(withIdentifier identifier: String) async {
+        guard let task = tasks[identifier],
+              let mgr = getChunkDownloadManager(task.identifier) else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for pause: \(identifier)")
+            return
         }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "Pausing task: \(identifier)")
+        await mgr.pause()
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 暂停后重新调度其他任务
     }
 
-    public func pauseAll() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            for task in self.tasks.values {
-                if let downloadTask = task as? DownloadTask {
-                    downloadTask.pause()
-                }
-            }
+    /// 恢复指定标识符的任务
+    /// - Parameter identifier: 任务的唯一标识符
+    func resumeTask(withIdentifier identifier: String) async {
+        guard let task = tasks[identifier],
+              let mgr = getChunkDownloadManager(task.identifier) else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for resume: \(identifier)")
+            return
         }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "Resuming task: \(identifier)")
+        await mgr.resume()
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 恢复后尝试启动下载
     }
 
-    public func resumeAll() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            for task in self.tasks.values {
-                if let downloadTask = task as? DownloadTask {
-                    downloadTask.resume()
-                }
-            }
+    /// 取消指定标识符的任务
+    /// - Parameter identifier: 任务的唯一标识符
+    func stopTask(withIdentifier identifier: String, cleanupFile: Bool) async {
+        guard let task = tasks[identifier],
+              let mgr = getChunkDownloadManager(task.identifier) else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for cancel: \(identifier)")
+            return
         }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "Cancelling task: \(identifier)")
+        await mgr.cancel()
+        await cleanupChunkManager(for: identifier, cleanupFile: cleanupFile) // 清理分片管理器
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 取消后重新调度
     }
 
-    public func cancelAll() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            for task in self.tasks.values {
-                if let downloadTask = task as? DownloadTask {
-                    downloadTask.cancel()
-                }
-            }
-            self.tasks.removeAll()
-            self.persistenceManager.clearTasks()
+    /// 移除指定标识符的任务
+    /// - Parameter identifier: 任务的唯一标识符
+    /// - Parameter cleanup: 是否同时清理下载的临时文件
+    func removeTask(withIdentifier identifier: String, cleanupFile: Bool) async {
+        guard let task = tasks[identifier] else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for remove: \(identifier)")
+            return
         }
-    }
 
-    public func removeAllFinish() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            let unfinishedTasks = self.tasks.values.filter { task in
-                if let downloadTask = task as? DownloadTask {
-                    return downloadTask.state != .completed
-                }
-                return true
-            }
-            self.tasks = ConcurrentArray(unfinishedTasks)
-            self.persistenceManager.saveTasks(unfinishedTasks.compactMap { $0 as? DownloadTask })
+        LoggerProxy.ILog(tag: kLogTag, msg: "Removing task: \(identifier)")
+
+        // 如果任务正在下载或准备下载，先取消它
+        if let mgr = getChunkDownloadManager(task.identifier) {
+            await mgr.cancel()
         }
+
+        await removeTaskInternal(withIdentifier: identifier)
+        await cleanupChunkManager(for: identifier, cleanupFile: cleanupFile)
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 移除后重新调度
     }
 
-    public func removeAll() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            self.tasks.removeAll()
-            self.persistenceManager.clearTasks()
+    /// 将指定标识符的任务插入到下载队列的最前端（高优先级）
+    /// - Parameter identifier: 任务的唯一标识符
+    func insertTaskAtFront(withIdentifier identifier: String) async {
+        guard let task = tasks[identifier] else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for insert: \(identifier)")
+            return
         }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "Inserting task at front: \(identifier)")
+
+        // 移除原位置并插入到前端
+        taskOrder.removeAll { $0 == identifier }
+        taskOrder.insert(identifier, at: 0)
+
+        // 如果当前活跃任务已满，尝试暂停优先级较低的任务，为高优先级任务腾出位置
+        if activeTaskIds.count >= configuration.maxConcurrentDownloads {
+            await pauseLeastPriorityActiveTask()
+        }
+
+        // 尝试启动这个高优先级任务
+        await startDownloadIfPossible(task)
+        await saveTasks() // 保存任务顺序变化
+        await notifyStateUpdate() // 通知外部状态已更新
     }
 
-    public func task(withIdentifier identifier: String) -> (any DownloadTaskProtocol)? {
-        return tasks.values.first { $0.identifier == identifier }
+    // MARK: - Batch Operations
+
+    /// 暂停所有下载任务
+    func pauseAllTasks() async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Pausing all tasks")
+
+        for task in tasks.values {
+            await getChunkDownloadManager(task.identifier)?.pause()
+        }
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 暂停所有后，确保队列空闲
     }
 
-    public func task(withURL url: URL) -> (any DownloadTaskProtocol)? {
+    /// 恢复所有可恢复的下载任务
+    func resumeAllTasks() async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Resuming all tasks")
+
+        for task in tasks.values {
+            await getChunkDownloadManager(task.identifier)?.resume()
+        }
+        await notifyStateUpdate() // 通知外部状态已更新
+        await scheduleNextDownloads() // 恢复所有后，开始调度下载
+    }
+
+    /// 取消所有下载任务
+    func stopAllTasks() async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Cancelling all tasks")
+
+        for task in tasks.values {
+            await cleanupChunkManager(for: task.identifier, cleanupFile: false) // 清理每个任务的分片管理器
+        }
+
+        tasks.removeAll()
+        taskOrder.removeAll()
+        activeTaskIds.removeAll()
+        persistenceManager.clearTasks() // 清除持久化数据
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 移除所有已完成（成功或失败）的任务
+    func removeAllFinishedTasks() async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Removing all finished tasks")
+
+        let finishedTaskIds = tasks.compactMap { key, task in
+            task.state.isFinished ? key : nil
+        }
+
+        for taskId in finishedTaskIds {
+            await cleanupChunkManager(for: taskId, cleanupFile: true)
+            tasks.removeValue(forKey: taskId)
+            taskOrder.removeAll { $0 == taskId }
+            activeTaskIds.remove(taskId) // 确保从活跃任务中移除
+        }
+
+        await saveTasks() // 保存任务列表变化
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 移除所有任务
+    func removeAllTasks() async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Removing all tasks")
+
+        // 彻底清理所有任务和资源
+        for taskId in tasks.keys {
+            await cleanupChunkManager(for: taskId, cleanupFile: true) // 确保所有分片管理器都被清理
+        }
+        tasks.removeAll()
+        taskOrder.removeAll()
+        activeTaskIds.removeAll()
+        persistenceManager.clearTasks() // 清除持久化数据
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    // MARK: - Task Query Methods
+
+    /// 根据标识符获取任务
+    /// - Parameter identifier: 任务的唯一标识符
+    /// - Returns: 对应的 DownloadTask 实例 (可选)
+    func getTask(withIdentifier identifier: String) -> DownloadTask? {
+        return tasks[identifier]
+    }
+
+    /// 根据 URL 获取任务
+    /// - Parameter url: 任务的 URL
+    /// - Returns: 对应的 DownloadTask 实例 (可选)
+    func getTask(withURL url: URL) -> DownloadTask? {
         return tasks.values.first { $0.url == url }
     }
 
-    public func removeTask(withIdentifier identifier: String) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            if let index = self.tasks.values.firstIndex(where: { $0.identifier == identifier }) {
-                self.tasks.remove(at: index)
-                self.persistenceManager.saveTasks(self.tasks.values.compactMap { $0 as? DownloadTask })
-            }
+    // MARK: - Wait for completion
+
+    /// 等待所有活跃任务完成
+    func waitForAllTasks() async throws {
+        let activeTasks = tasks.values.filter { !$0.state.isFinished }
+
+        guard !activeTasks.isEmpty else {
+            LoggerProxy.DLog(tag: kLogTag, msg: "No active tasks to wait for.")
+            return
         }
-    }
 
-    public func removeTask(withURL url: URL) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            if let index = self.tasks.values.firstIndex(where: { $0.url == url }) {
-                self.tasks.remove(at: index)
-                self.persistenceManager.saveTasks(self.tasks.values.compactMap { $0 as? DownloadTask })
-            }
-        }
-    }
+        LoggerProxy.ILog(tag: kLogTag, msg: "Waiting for \(activeTasks.count) active tasks to complete...")
 
-    public func waitForAllTasks() async throws {
-        return try await withCheckedThrowingContinuation { continuation in
-            queue.async { [weak self] in
-                guard let self = self else {
-                    continuation.resume(throwing: DownloadError.unknown("DownloadManager已释放"))
-                    return
-                }
-
-                let group = DispatchGroup()
-                var lastError: Error?
-
-                for task in self.tasks.values {
-                    group.enter()
-                    if let downloadTask = task as? DownloadTask {
-                        downloadTask.statePublisher
-                            .filter { $0.isFinished }
-                            .prefix(1)
-                            .sink { state in
-                                if case let .failed(error) = state {
-                                    lastError = error
-                                }
-                                group.leave()
+        // 使用 TaskGroup 等待所有任务完成，任何一个任务失败则抛出错误
+        return try await withThrowingTaskGroup(of: Void.self) { group in
+            for task in activeTasks {
+                group.addTask {
+                    for await state in task.statePublisher.values {
+                        if state.isFinished {
+                            if case let .failed(error) = state {
+                                throw error // 如果任务失败，抛出错误
                             }
-                            .store(in: &self.cancellables)
-                    } else {
-                        group.leave()
-                    }
-                }
-
-                group.notify(queue: .main) {
-                    if let error = lastError {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
+                            break // 任务完成，退出循环
+                        }
                     }
                 }
             }
+            try await group.waitForAll() // 等待所有任务完成
+            LoggerProxy.ILog(tag: kLogTag, msg: "All active tasks completed.")
         }
+    }
+
+    // MARK: - Private Internal Methods
+
+    /// 添加新任务到内部管理
+    /// - Parameter task: 要添加的 DownloadTask 实例
+    private func addNewTask(_ task: DownloadTask) async {
+        tasks[task.identifier] = task
+        taskOrder.append(task.identifier)
+        await saveTasks() // 保存任务列表
+        LoggerProxy.DLog(tag: kLogTag, msg: "Added new task: \(task.identifier)")
+        await notifyStateUpdate() // 通知外部状态已更新
+        // 尝试开始下载这个新任务
+        await startDownloadIfPossible(task)
+    }
+
+    /// 从内部管理中移除任务
+    /// - Parameter identifier: 要移除任务的唯一标识符
+    private func removeTaskInternal(withIdentifier identifier: String) async {
+        tasks.removeValue(forKey: identifier)
+        taskOrder.removeAll { $0 == identifier }
+        activeTaskIds.remove(identifier) // 确保从活跃任务中移除
+        await saveTasks()
+        LoggerProxy.DLog(tag: kLogTag, msg: "Removed task internal: \(identifier)")
+    }
+
+    /// 判断任务是否可以开始下载
+    /// - Parameter task: 要检查的任务
+    /// - Returns: 如果任务可以开始下载，则为 true
+//    private func canStartDownloading(task: DownloadTask) -> Bool {
+//        // 如果已经有 ChunkManager 在运行，说明任务已在处理中，不能重复开始
+//        if getChunkDownloadManager(task.identifier) != nil {
+//            return false
+//        }
+//
+//        // 检查并发限制
+//        if activeTaskIds.count >= configuration.maxConcurrentDownloads {
+//            LoggerProxy.DLog(tag: kLogTag, msg: "Cannot start task \(task.identifier): Max concurrent downloads reached.")
+//            return false
+//        }
+//
+//        // 检查任务状态，只有在可以恢复或初始状态时才能开始
+//        return task.state.canResume || task.state == .initialed
+//    }
+
+    /// 尝试启动一个下载任务，如果条件允许
+    /// - Parameter task: 要启动的 DownloadTask 实例
+    private func startDownloadIfPossible(_ task: DownloadTask) async {
+        /// 并发检查
+        if activeTaskIds.count >= configuration.maxConcurrentDownloads {
+            LoggerProxy.DLog(tag: kLogTag, msg: "Cannot start task \(task.identifier): Max concurrent downloads reached.")
+            return
+        }
+
+        if let chunkMgr = getChunkDownloadManager(task.identifier),
+           await chunkMgr.state == .paused {
+            /// 如果并发允许条件下，并且任务是暂停的, 恢复任务
+            await chunkMgr.resume()
+            return
+        }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "Starting download for task: \(task.identifier)")
+        let chunkConfig = ChunkConfiguration(
+            chunkSize: task.taskConfigure.chunkSize,
+            maxConcurrentChunks: task.taskConfigure.maxConcurrentChunks
+        )
+
+        // 创建并设置分片下载管理器
+        let chunkManager = ChunkDownloadManager(
+            downloadTask: task,
+            configuration: chunkConfig,
+            delegate: self // 设置 actor 自身为代理，处理回调
+        )
+        await set(chunkDownloadManager: chunkManager, for: task.identifier)
+        activeTaskIds.insert(task.identifier) // 将任务标记为活跃
+        await chunkManager.start() // 启动任务
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 调度下一次下载任务
+    private func scheduleNextDownloads() async {
+        let currentActive = activeTaskIds.count
+        let maxConcurrent = configuration.maxConcurrentDownloads
+
+        LoggerProxy.DLog(tag: kLogTag, msg: "Scheduling downloads: Current active: \(currentActive), Max concurrent: \(maxConcurrent)")
+
+        if currentActive > maxConcurrent {
+            // 暂停多余的任务，从队列末尾的活跃任务开始暂停
+            await pauseExcessTasks(excess: currentActive - maxConcurrent)
+        } else if currentActive < maxConcurrent {
+            // 启动等待中的任务，优先启动队列前端的任务
+            await startWaitingTasks(slots: maxConcurrent - currentActive)
+        }
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 暂停超出并发限制的任务
+    /// - Parameter excess: 需要暂停的任务数量
+    private func pauseExcessTasks(excess: Int) async {
+        var pausedCount = 0
+
+        // 从 taskOrder 的末尾（通常是优先级较低或较晚添加的任务）开始遍历
+        for taskId in taskOrder.reversed() {
+            if pausedCount >= excess { break } // 已暂停足够数量的任务
+
+            if let task = tasks[taskId],
+               task.state == .downloading, // 确保任务正在下载中
+               activeTaskIds.contains(taskId) { // 确保是活跃任务
+                await getChunkDownloadManager(taskId)?.pause()
+                pausedCount += 1
+                activeTaskIds.remove(taskId) // 从活跃任务集合中移除
+                LoggerProxy.DLog(tag: kLogTag, msg: "Paused excess task: \(taskId)")
+            }
+        }
+    }
+
+    /// 启动等待中的任务，填补空闲的下载槽位
+    /// - Parameter slots: 可用的下载槽位数量
+    private func startWaitingTasks(slots: Int) async {
+        var startedCount = 0
+
+        // 遍历任务顺序，从队列前端开始
+        for taskId in taskOrder {
+            if startedCount >= slots { break } // 已启动足够数量的任务
+
+            if let task = tasks[taskId],
+               task.state.canResume || task.state == .initialed, // 任务可以恢复或处于初始状态
+               !activeTaskIds.contains(taskId) { // 确保任务当前不活跃
+                await startDownloadIfPossible(task)
+                startedCount += 1
+            }
+        }
+    }
+
+    /// 暂停优先级最低的活跃任务（用于为新插入的高优先级任务腾出位置）
+    private func pauseLeastPriorityActiveTask() async {
+        // 从任务顺序的末尾开始找第一个活跃任务并暂停
+        for taskId in taskOrder.reversed() {
+            if let task = tasks[taskId],
+               task.state == .downloading,
+               activeTaskIds.contains(taskId) {
+                await getChunkDownloadManager(taskId)?.cancel()
+                await set(chunkDownloadManager: nil, for: taskId)
+                task.stateSubject.send(.initialed)
+                activeTaskIds.remove(taskId)
+                LoggerProxy.DLog(tag: kLogTag, msg: "Paused least priority active task for priority insertion: \(taskId)")
+                break
+            }
+        }
+    }
+
+    /// 清理指定任务的分片下载管理器
+    /// - Parameter identifier: 任务的唯一标识符
+    private func cleanupChunkManager(for identifier: String, cleanupFile: Bool) async {
+        if let manager = getChunkDownloadManager(identifier) {
+            if cleanupFile {
+                await manager.cleanup() // 执行分片管理器的清理操作
+            }
+            await set(chunkDownloadManager: nil, for: identifier)
+        }
+        activeTaskIds.remove(identifier) // 确保从活跃任务集合中移除
+        LoggerProxy.DLog(tag: kLogTag, msg: "Cleaned up chunk manager for: \(identifier)")
+    }
+
+    /// 处理任务状态变化
+    /// - Parameters:
+    ///   - task: 状态发生变化的 DownloadTask 实例
+    ///   - state: 任务的最新状态
+    private func handleTaskStateChange(task: DownloadTask, state: DownloadState) async {
+        LoggerProxy.DLog(tag: kLogTag, msg: "Task \(task.identifier) state changed to: \(state)")
+
+        // 如果任务完成（成功、取消或失败），进行清理和调度
+        if state.isFinished {
+            await cleanupChunkManager(for: task.identifier, cleanupFile: state == .completed /* 完成才主动删除文件夹 */ ) // 清理资源
+            activeTaskIds.remove(task.identifier) // 从活跃任务集合中移除
+            await scheduleNextDownloads() // 重新调度下一个下载
+            await saveTasks() // 保存任务状态
+        } else if state == .downloading {
+            // 确保任务在下载中时被标记为活跃
+            activeTaskIds.insert(task.identifier)
+        } else {
+            // 如果任务暂停或准备中，且不在下载中，则从活跃任务中移除
+            activeTaskIds.remove(task.identifier)
+        }
+        // 处理重试逻辑
+        if case let .failed(error) = state,
+           let retryStrategy = task.taskConfigure.retryStrategy {
+            await handleTaskRetry(task: task, error: error, retryStrategy: retryStrategy)
+        }
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 处理任务重试逻辑
+    /// - Parameters:
+    ///   - task: 发生错误的任务
+    ///   - error: 任务失败的错误
+    ///   - retryStrategy: 任务的重试策略
+    private func handleTaskRetry(task: DownloadTask, error: DownloadError, retryStrategy: RetryStrategy) async {
+        let (interval, shouldRetry) = retryStrategy.nextRetryInterval(for: task.retryCount, error: error)
+
+        if shouldRetry {
+            task.retryCount += 1 // 增加重试次数
+            LoggerProxy.ILog(tag: kLogTag, msg: "Retrying task \(task.identifier), attempt: \(task.retryCount). Next retry in \(interval) seconds.")
+            // 延迟后重试
+            Task { [weak self, weak task] in
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1000000000))
+                guard let task = task, let self = self else { return }
+                await self.startDownloadIfPossible(task) // 尝试重新启动任务
+            }
+        } else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Max retry attempts reached for task: \(task.identifier). Error: \(error.localizedDescription)")
+            // 如果不再重试，任务最终状态应为失败
+            if task.state != .failed(error) { // 避免重复设置失败状态
+                task.stateSubject.send(.failed(error))
+            }
+        }
+    }
+
+    /// 处理网络状态变化
+    /// - Parameter status: 最新的网络状态
+    private func handleNetworkStateChange(_ status: NetworkStatus) async {
+        LoggerProxy.ILog(tag: kLogTag, msg: "Network state changed: \(status)")
+
+        switch status {
+        case let .connected(type):
+            // 网络恢复时，检查配置并尝试恢复暂停的任务
+            LoggerProxy.ILog(tag: kLogTag, msg: "Network connected (\(type)). Scheduling paused tasks.")
+            await resumePausedTasksBasedOnNetworkType(type)
+            await scheduleNextDownloads() // 重新调度所有任务
+        case .disconnected:
+            LoggerProxy.WLog(tag: kLogTag, msg: "Network disconnected. Pausing all active downloads.")
+            // 网络断开时，暂停所有正在下载的任务
+            for taskId in activeTaskIds {
+                if let task = tasks[taskId], task.state == .downloading {
+                    await getChunkDownloadManager(taskId)?.pause()
+                }
+            }
+        case .restricted:
+            LoggerProxy.WLog(tag: kLogTag, msg: "Network restricted.")
+            // 可以在此根据配置决定是否暂停蜂窝网络下载
+            break
+        }
+        await notifyStateUpdate() // 通知外部状态已更新
+    }
+
+    /// 根据网络类型恢复暂停的任务
+    /// - Parameter networkType: 当前的网络类型
+    private func resumePausedTasksBasedOnNetworkType(_ networkType: NetworkType) async {
+        for taskId in taskOrder {
+            if let task = tasks[taskId], task.state == .paused {
+                let allowCellular = task.taskConfigure.allowCellularDownloads ?? configuration.defaultTaskConfiguration.allowCellularDownloads ?? true
+                let autoResumeOnWifi = configuration.autoResumeOnWifi
+                let autoPauseOnCellular = configuration.autoPauseOnCellular
+
+                if networkType == .wifi && autoResumeOnWifi {
+                    LoggerProxy.DLog(tag: kLogTag, msg: "Auto-resuming task \(taskId) on WiFi.")
+                    await getChunkDownloadManager(taskId)?.resume()
+                } else if networkType == .cellular && allowCellular && !autoPauseOnCellular {
+                    LoggerProxy.DLog(tag: kLogTag, msg: "Auto-resuming task \(taskId) on cellular (allowed).")
+                    await getChunkDownloadManager(taskId)?.resume()
+                } else if networkType == .cellular && autoPauseOnCellular {
+                    LoggerProxy.DLog(tag: kLogTag, msg: "Keeping task \(taskId) paused on cellular due to autoPauseOnCellular setting.")
+                    // 任务保持暂停状态
+                }
+            }
+        }
+    }
+
+    /// 持久化所有任务的状态
+    private func saveTasks() async {
+        let downloadTasks = Array(tasks.values)
+        persistenceManager.saveTasks(downloadTasks)
+        LoggerProxy.DLog(tag: kLogTag, msg: "Saved \(downloadTasks.count) tasks to persistence.")
+    }
+
+    /// 通知外部 DownloadManager 更新其状态
+    private func notifyStateUpdate() async {
+        await stateUpdateHandler?()
     }
 }
 
-// MARK: - ChunkDownloadManagerDelegate
+// MARK: - Public DownloadManager Interface
 
-extension DownloadManager: ChunkDownloadManagerDelegate {
-    public func chunkDownloadManager(_ manager: ChunkDownloadManager, didUpdateProgress progress: Double) {
-        // 进度更新由 DownloadTask 内部处理
-        if let task = manager.downloadTask as? DownloadTask {
-            task.progressSubject.send(progress)
-        }
+/// 下载管理器的公共接口，作为客户端与 Actor 交互的桥梁
+public final class DownloadManager: DownloadManagerProtocol {
+    // MARK: - Public Properties
+
+    /// 管理器公开的状态对象，通过 ObservableObject 模式发布
+    public let state = DownloadManagerState()
+    /// 与 DownloadManagerActor 交互的引用
+    private let actor: DownloadManagerActor
+
+    // Combine Publishers 用于订阅状态变化
+    public var activeTaskCountPublisher: AnyPublisher<Int, Never> {
+        state.$activeTaskCount.eraseToAnyPublisher()
     }
 
-    public func chunkDownloadManager(_ manager: ChunkDownloadManager, didUpdateState state: DownloadState) {
-        if let task = manager.downloadTask as? DownloadTask {
-            task.stateSubject.send(state)
-        }
-
-        if state.isFinished {
-            // 如果是任务完成，刷新活动任务数，并开始新任务
-            decreaseActive()
-            checkAndScheduleDownload()
-        }
+    public var allTasksPublisher: AnyPublisher<[any DownloadTaskProtocol], Never> {
+        // 使用 map 操作符将 DownloadTask 转换为 DownloadTaskProtocol
+        state.$allTasks.map { tasks in
+            tasks.map { $0 as DownloadTaskProtocol }
+        }.eraseToAnyPublisher()
     }
 
-    public func chunkDownloadManager(_ manager: ChunkDownloadManager, didCompleteWithURL url: URL) {
-        // 下载完成由 DownloadTask 内部处理
+    // 同步获取所有任务列表
+    public var allTasks: [any DownloadTaskProtocol] {
+        // 直接从状态中获取，因为状态由 Actor 异步更新
+        state.allTasks
     }
 
-    public func chunkDownloadManager(_ manager: ChunkDownloadManager, didFailWithError error: Error) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
+    // 同步获取活跃任务数量
+    public var activeTaskCount: Int {
+        state.activeTaskCount
+    }
 
-            // 检查是否需要重试
-            if let downloadTask = manager.downloadTask as? DownloadTask,
-               let retryStrategy = downloadTask.taskConfigure.retryStrategy {
-                let downloadError = error as? DownloadError ?? DownloadError.unknown(error.localizedDescription)
-                let shouldRetry = retryStrategy.shouldRetry(error: downloadError, attempt: downloadTask.retryCount)
-
-                if shouldRetry {
-                    // 重新调度下载
-                    self.startDownload(downloadTask)
-                }
+    // 同步获取和设置最大并发下载数
+    public var maxConcurrentDownloads: Int {
+        get { state.maxConcurrentDownloads }
+        set {
+            // 设置操作异步转发给 Actor
+            Task {
+                await actor.setMaxConcurrentDownloads(newValue)
             }
         }
     }
 
-    // 检查下载并发数量，暂停或者开始新的下载任务
-    private func checkAndScheduleDownload() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
+    private var cancellables = Set<AnyCancellable>() // 用于管理 Combine 订阅
 
-            // 获取当前活动任务数
-            let currentActiveCount = self.activeTaskCount
+    // MARK: - Initialization
 
-            // 如果当前活动任务数超过最大并发数，需要暂停一些任务
-            if currentActiveCount > self.maxConcurrentDownloads {
-                // 计算需要暂停的任务数量
-                let tasksToPause = currentActiveCount - self.maxConcurrentDownloads
+    /// 初始化 DownloadManager
+    /// - Parameter configuration: 下载管理器的配置
+    public init(configuration: DownloadManagerConfiguration) {
+        actor = DownloadManagerActor(configuration: configuration)
 
-                // 找到正在下载的任务并暂停
-                var pausedCount = 0
-                for task in self.tasks.values {
-                    if pausedCount >= tasksToPause {
-                        break
-                    }
-
-                    if let downloadTask = task as? DownloadTask,
-                       downloadTask.state == .downloading {
-                        downloadTask.pause()
-                        pausedCount += 1
-                    }
-                }
-            }
-            // 如果当前活动任务数小于最大并发数，可以启动新的下载任务
-            else if currentActiveCount < self.maxConcurrentDownloads {
-                // 计算可以启动的新任务数量
-                let availableSlots = self.maxConcurrentDownloads - currentActiveCount
-
-                // 找到等待中的任务并启动
-                var startedCount = 0
-                for task in self.tasks.values {
-                    if startedCount >= availableSlots {
-                        break
-                    }
-
-                    if let downloadTask = task as? DownloadTask,
-                       downloadTask.state == .waiting {
-                        self.startDownload(downloadTask)
-                        startedCount += 1
-                    }
-                }
+        // 将状态更新的闭包传递给 Actor，以便 Actor 可以通知 DownloadManager 更新公共状态
+        Task {
+            await actor.setStateUpdateHandler { [weak self] in
+                await self?.updateStateFromActor()
             }
         }
+
+        LoggerProxy.ILog(tag: kLogTag, msg: "DownloadManager initialized")
+    }
+
+    /// Deinitialization
+    deinit {
+        LoggerProxy.ILog(tag: kLogTag, msg: "DownloadManager deinitialized")
+        cancellables.forEach { $0.cancel() } // 取消所有 Combine 订阅
+        let actor = actor
+        Task {
+            await actor.stopAllTasks()
+        }
+    }
+
+    // MARK: - State Synchronization
+
+    /// 从 Actor 同步最新的状态到 DownloadManagerState
+    @MainActor
+    private func updateStateFromActor() async {
+        let tasks = await actor.getAllTasks()
+        let activeCount = await actor.getActiveTaskCount()
+        let maxConcurrent = await actor.getMaxConcurrentDownloads()
+
+        // 在主线程更新 @Published 属性
+        state.updateAllTasks(tasks)
+        state.updateActiveTaskCount(activeCount)
+        state.updateMaxConcurrentDownloads(maxConcurrent)
+    }
+
+    // MARK: - Public Task Management Methods (Non-async)
+
+    /// 创建并开始一个下载任务。此方法会立即返回一个 DownloadTaskProtocol 实例。
+    /// - Parameters:
+    ///   - url: 下载源 URL
+    ///   - destination: 下载目标 URL
+    ///   - configuration: 任务的特定配置 (可选)
+    /// - Returns: 创建或已存在的 DownloadTask 实例
+    public func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration? = nil) -> any DownloadTaskProtocol {
+        let identifier = DownloadTask.buildIdentifier(url: url, destinationURL: destination)
+
+        // 尝试立即返回已存在的任务，以实现同步接口
+        if let existingTask = state.allTasks.first(where: { $0.identifier == identifier }) {
+            LoggerProxy.DLog(tag: kLogTag, msg: "Returning existing task for download: \(identifier)")
+            return existingTask
+        }
+
+        // 如果任务不存在，创建一个临时的 DownloadTask 实例并立即返回，实际的 Actor 操作在后台进行
+        let config = configuration ?? DownloadManagerConfiguration().defaultTaskConfiguration
+        let tempTask = DownloadTask(url: url, destinationURL: destination, identifier: identifier, configuration: config)
+
+        // 异步在 Actor 中创建和管理实际任务
+        Task {
+            await actor.createDownloadTask(url: url, destination: destination, configuration: configuration)
+            // actor 内部会调用 notifyStateUpdate() 来更新 DownloadManager 的状态
+        }
+
+        LoggerProxy.DLog(tag: kLogTag, msg: "Created temp task and started actor creation for: \(identifier)")
+        return tempTask
+    }
+
+    /// 暂停指定的下载任务
+    /// - Parameter task: 要暂停的任务实例
+    public func pause(task: any DownloadTaskProtocol) {
+        pause(withIdentifier: task.identifier)
+    }
+
+    /// 暂停指定标识符的下载任务
+    /// - Parameter identifier: 任务的唯一标识符
+    public func pause(withIdentifier identifier: String) {
+        Task {
+            await actor.pauseTask(withIdentifier: identifier)
+        }
+    }
+
+    /// 恢复指定的下载任务
+    /// - Parameter task: 要恢复的任务实例
+    public func resume(task: any DownloadTaskProtocol) {
+        resume(withIdentifier: task.identifier)
+    }
+
+    /// 恢复指定标识符的下载任务
+    /// - Parameter identifier: 任务的唯一标识符
+    public func resume(withIdentifier identifier: String) {
+        Task {
+            await actor.resumeTask(withIdentifier: identifier)
+        }
+    }
+
+    /// 取消指定的下载任务
+    /// - Parameter task: 要取消的任务实例
+    public func cancel(task: any DownloadTaskProtocol) {
+        cancel(withIdentifier: task.identifier)
+    }
+
+    /// 取消指定标识符的下载任务
+    /// - Parameter identifier: 任务的唯一标识符
+    public func cancel(withIdentifier identifier: String) {
+        Task {
+            await actor.stopTask(withIdentifier: identifier, cleanupFile: false)
+        }
+    }
+
+    /// 移除指定 URL 的下载任务
+    /// - Parameter url: 任务的 URL
+    public func remove(withURL url: URL) {
+        if let task = task(withURL: url) {
+            remove(withIdentifier: task.identifier)
+        } else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task with URL \(url) not found for removal.")
+        }
+    }
+
+    /// 移除指定的下载任务
+    /// - Parameter task: 要移除的任务实例
+    public func remove(task: any DownloadTaskProtocol) {
+        remove(withIdentifier: task.identifier)
+    }
+
+    /// 移除指定标识符的下载任务
+    /// - Parameter identifier: 任务的唯一标识符
+    public func remove(withIdentifier identifier: String) {
+        Task {
+            await actor.removeTask(withIdentifier: identifier, cleanupFile: true)
+        }
+    }
+
+    /// 将指定的下载任务插入到下载队列的最前端（高优先级）
+    /// - Parameter task: 要插入的任务实例
+    public func insert(task: any DownloadTaskProtocol) {
+        insert(withIdentifier: task.identifier)
+    }
+
+    /// 将指定标识符的下载任务插入到下载队列的最前端（高优先级）
+    /// - Parameter identifier: 任务的唯一标识符
+    public func insert(withIdentifier identifier: String) {
+        Task {
+            await actor.insertTaskAtFront(withIdentifier: identifier)
+        }
+    }
+
+    // MARK: - Batch Operations (Non-async)
+
+    /// 暂停所有下载任务
+    public func pauseAll() {
+        Task {
+            await actor.pauseAllTasks()
+        }
+    }
+
+    /// 恢复所有可恢复的下载任务
+    public func resumeAll() {
+        Task {
+            await actor.resumeAllTasks()
+        }
+    }
+
+    /// 取消所有下载任务
+    public func cancelAll() {
+        Task {
+            await actor.stopAllTasks()
+        }
+    }
+
+    /// 移除所有已完成（成功或失败）的任务
+    public func removeAllFinished() {
+        Task {
+            await actor.removeAllFinishedTasks()
+        }
+    }
+
+    /// 移除所有任务
+    public func removeAll() {
+        Task {
+            await actor.removeAllTasks()
+        }
+    }
+
+    // MARK: - Task Query Methods (Synchronous access to published state)
+
+    /// 根据标识符查询任务
+    /// - Parameter identifier: 任务的唯一标识符
+    /// - Returns: 对应的 DownloadTaskProtocol 实例 (可选)
+    public func task(withIdentifier identifier: String) -> (any DownloadTaskProtocol)? {
+        return state.allTasks.first { $0.identifier == identifier }
+    }
+
+    /// 根据 URL 查询任务
+    /// - Parameter url: 任务的 URL
+    /// - Returns: 对应的 DownloadTaskProtocol 实例 (可选)
+    public func task(withURL url: URL) -> (any DownloadTaskProtocol)? {
+        return state.allTasks.first { $0.url == url }
+    }
+
+    // MARK: - Async Wait Method
+
+    /// 异步等待所有活跃任务完成
+    public func waitForAllTasks() async throws {
+        try await actor.waitForAllTasks()
+    }
+}
+
+// MARK: - ChunkDownloadManagerDelegate Extension for DownloadManagerActor
+
+extension DownloadManagerActor: ChunkDownloadManagerDelegate {
+    /// 分片下载管理器完成一个任务时回调
+    /// - Parameters:
+    ///   - manager: 触发回调的 ChunkDownloadManager
+    ///   - task: 完成的 DownloadTask
+
+    /// 分片下载管理器更新任务进度时回调
+    /// - Parameters:
+    ///   - manager: 触发回调的 ChunkDownloadManager
+    ///   - task: 正在更新进度的 DownloadTask
+    ///   - progress: 当前进度 (downloadedBytes, totalBytes)
+    public nonisolated func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateProgress progress: (Int64, Int64)) {
+        // 这个方法是非隔离的，需要跳回 Actor 才能访问其状态
+        LoggerProxy.VLog(tag: kLogTag, msg: "下载进度:\(task.identifier),progress=\(progress)")
+    }
+
+    /// 分片下载管理器更新任务状态时回调
+    /// - Parameters:
+    ///   - manager: 触发回调的 ChunkDownloadManager
+    ///   - task: 状态发生变化的 DownloadTask
+    ///   - state: 任务的最新状态
+    public nonisolated func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateState state: DownloadState) {
+        // 这个方法是非隔离的，需要跳回 Actor 才能访问其状态
+        LoggerProxy.DLog(tag: kLogTag, msg: "下载状态变化:\(task.identifier),state=\(state)")
+        Task {
+            await self.handleTaskStateChange(task: task, state: state)
+        }
+    }
+
+    /// 分片下载管理器任务失败时回调
+    /// - Parameters:
+    ///   - manager: 触发回调的 ChunkDownloadManager
+    ///   - task: 失败的 DownloadTask
+    ///   - error: 失败的错误信息
+    public nonisolated func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didFailWithError error: any Error) {
+        LoggerProxy.ILog(tag: kLogTag, msg: "下载失败:\(task.identifier),error=\(error)")
+    }
+
+    public nonisolated func chunkDownloadManager(_ manager: ChunkDownloadManager, didCompleteWith task: DownloadTask) {
+        LoggerProxy.ILog(tag: kLogTag, msg: "下载完成:\(task.identifier)")
     }
 }

@@ -2,9 +2,8 @@ import Foundation
 
 /// 下载状态
 public enum DownloadState: Codable, Equatable {
-    
     /// 等待中
-    case waiting
+    case initialed
 
     /// 准备中
     case preparing
@@ -15,6 +14,9 @@ public enum DownloadState: Codable, Equatable {
     /// 暂停中
     case paused
 
+    /// 下载完成，文件合并中
+    case merging
+
     /// 已完成
     case completed
 
@@ -23,24 +25,25 @@ public enum DownloadState: Codable, Equatable {
 
     /// 失败
     case failed(DownloadError)
-    
-    
+
     // Codable 实现
     enum CodingKeys: String, CodingKey {
-        case waiting, preparing, downloading, paused, completed, failed, cancelled, errorCode, errorDescription
+        case initialed, preparing, downloading, paused, merging, completed, failed, cancelled, errorCode, errorDescription
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .waiting:
-            try container.encode("waiting", forKey: .waiting)
+        case .initialed:
+            try container.encode("initialed", forKey: .initialed)
         case .preparing:
             try container.encode("preparing", forKey: .preparing)
         case .downloading:
             try container.encode("downloading", forKey: .downloading)
         case .paused:
             try container.encode("paused", forKey: .paused)
+        case .merging:
+            try container.encode("merging", forKey: .merging)
         case .completed:
             try container.encode("completed", forKey: .completed)
         case let .failed(error):
@@ -54,14 +57,16 @@ public enum DownloadState: Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if container.contains(.waiting) {
-            self = .waiting
+        if container.contains(.initialed) {
+            self = .initialed
         } else if container.contains(.preparing) {
             self = .preparing
         } else if container.contains(.downloading) {
             self = .downloading
         } else if container.contains(.paused) {
             self = .paused
+        } else if container.contains(.merging) {
+            self = .merging
         } else if container.contains(.completed) {
             self = .completed
         } else if container.contains(.failed) {
@@ -78,14 +83,14 @@ public enum DownloadState: Codable, Equatable {
         } else if container.contains(.cancelled) {
             self = .cancelled
         } else {
-            self = .waiting
+            self = .initialed
         }
     }
 
     /// 比较两个下载状态是否相等
     public static func == (lhs: DownloadState, rhs: DownloadState) -> Bool {
         switch (lhs, rhs) {
-        case (.waiting, .waiting),
+        case (.initialed, .initialed),
              (.preparing, .preparing),
              (.downloading, .downloading),
              (.paused, .paused),
@@ -102,7 +107,7 @@ public enum DownloadState: Codable, Equatable {
     /// 获取状态的描述
     public var description: String {
         switch self {
-        case .waiting:
+        case .initialed:
             return "等待中"
         case .preparing:
             return "准备中"
@@ -110,6 +115,8 @@ public enum DownloadState: Codable, Equatable {
             return "下载中"
         case .paused:
             return "已暂停"
+        case .merging:
+            return "合并中"
         case .completed:
             return "已完成"
         case .cancelled:
@@ -132,7 +139,7 @@ public enum DownloadState: Codable, Equatable {
     /// 检查状态是否表示任务可以继续
     public var canResume: Bool {
         switch self {
-        case .waiting, .paused, .failed:
+        case .initialed, .paused, .failed:
             return true
         default:
             return false
@@ -142,7 +149,7 @@ public enum DownloadState: Codable, Equatable {
     /// 检查状态是否表示任务可以暂停
     public var canPause: Bool {
         switch self {
-        case .downloading:
+        case .downloading, .preparing:
             return true
         default:
             return false
@@ -152,7 +159,7 @@ public enum DownloadState: Codable, Equatable {
     /// 检查状态是否表示任务可以取消
     public var canCancel: Bool {
         switch self {
-        case .waiting, .preparing, .downloading, .paused:
+        case .initialed, .preparing, .downloading, .paused:
             return true
         default:
             return false

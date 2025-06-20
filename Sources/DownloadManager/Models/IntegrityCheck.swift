@@ -9,6 +9,10 @@ public enum IntegrityCheckType: String, Codable {
     case sha1
     /// SHA256 校验
     case sha256
+    /// CRC384 校验
+    case sha384
+    /// CRC512 校验
+    case sha512
     /// CRC32 校验
     case crc32
     /// 文件大小校验
@@ -54,8 +58,6 @@ public enum IntegrityCheckError: LocalizedError {
             return "响应头中未找到校验信息"
         case let .unknown(error):
             return "未知错误: \(error.localizedDescription)"
-            
-                
         }
     }
 }
@@ -68,38 +70,40 @@ public final class IntegrityChecker {
     ///   - checkType: 校验类型
     ///   - responseHeaders: HTTP 响应头
     /// - Returns: 校验结果
-    public static func check(
-        fileURL: URL,
-        checkType: IntegrityCheckType,
-        responseHeaders: [String: String]? = nil
-    ) -> IntegrityCheckResult {
-        do {
-            switch checkType {
-            case .md5:
-                let actualHash = try calculateHash(for: fileURL, type: .md5)
-                return .success
-            case .sha1:
-                let actualHash = try calculateHash(for: fileURL, type: .sha1)
-                return .success
-            case .sha256:
-                let actualHash = try calculateHash(for: fileURL, type: .sha256)
-                return .success
-            case .crc32:
-                let actualHash = try calculateHash(for: fileURL, type: .crc32)
-                return .success
-            case .fileSize:
-                let actualSize = try calculateHash(for: fileURL, type: .fileSize)
-                return .success
-            case .fromResponseHeaders:
-                guard let headers = responseHeaders else {
-                    return .failure(IntegrityCheckError.noChecksumInHeaders)
-                }
-                return try checkWithResponseHeaders(fileURL: fileURL, headers: headers)
-            }
-        } catch {
-            return .failure(IntegrityCheckError.unknown(error))
-        }
-    }
+//    public static func check(
+//        fileURL: URL,
+//        checkType: IntegrityCheckType,
+//        responseHeaders: [String: String]? = nil
+//    ) -> IntegrityCheckResult {
+//        do {
+//            let actualHash: String
+//            switch checkType {
+//            case .md5:
+//                actualHash = try calculateHash(for: fileURL, type: .md5)
+//                return .success
+//            case .sha1:
+//                actualHash = try calculateHash(for: fileURL, type: .sha1)
+//                return .success
+//            case .sha256:
+//                actualHash = try calculateHash(for: fileURL, type: .sha256)
+//                return .success
+//            case .crc32:
+//                actualHash = try calculateHash(for: fileURL, type: .crc32)
+//                return .success
+//            case .fileSize:
+//                actualSize = try calculateHash(for: fileURL, type: .fileSize)
+//                return .success
+//            case .fromResponseHeaders:
+//                guard let headers = responseHeaders else {
+//                    return .failure(IntegrityCheckError.noChecksumInHeaders)
+//                }
+//                return try checkWithResponseHeaders(fileURL: fileURL, headers: headers)
+//            }
+//
+//        } catch {
+//            return .failure(IntegrityCheckError.unknown(error))
+//        }
+//    }
 
     /// 计算文件的哈希值
     public static func calculateHash(for url: URL, type: IntegrityCheckType) throws -> String {
@@ -107,10 +111,8 @@ public final class IntegrityChecker {
         defer { try? fileHandle.close() }
 
         switch type {
-        case .md5, .sha1, .sha256:
+        case .md5, .sha1, .sha256, .sha384, .sha512, .crc32:
             return try calculateIncrementalHash(for: fileHandle, type: type)
-        case .crc32:
-            return try calculateCRC32(for: fileHandle)
         case .fileSize:
             return try calculateFileSize(for: url)
         case .fromResponseHeaders:
@@ -119,9 +121,9 @@ public final class IntegrityChecker {
     }
 
     /// 计算增量哈希值（MD5、SHA1、SHA256）
-    private static func calculateIncrementalHash(for fileHandle: FileHandle, type: IntegrityCheckType) throws -> String {
+    static func calculateIncrementalHash(for fileHandle: FileHandle, type: IntegrityCheckType) throws -> String {
         let blockSize = 8192 // 8KB 块大小
-
+        try fileHandle.seek(toOffset: 0)
         switch type {
         case .md5:
             var hasher = Insecure.MD5()
@@ -143,26 +145,38 @@ public final class IntegrityChecker {
                 hasher.update(data: data)
             }
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        case .sha384:
+            var hasher = SHA384()
+            while let data = try fileHandle.read(upToCount: blockSize) {
+                hasher.update(data: data)
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        case .sha512:
+            var hasher = SHA512()
+            while let data = try fileHandle.read(upToCount: blockSize) {
+                hasher.update(data: data)
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 
-        case .crc32, .fileSize, .fromResponseHeaders:
+        case .crc32:
+            var crc32Hasher: CRC32 = CRC32()
+            while let data = try fileHandle.read(upToCount: blockSize) {
+                crc32Hasher.update(data: data)
+            }
+            return String(format: "%08X", crc32Hasher.finalize())
+        case .fileSize:
+            try fileHandle.seekToEnd()
+            return String(try fileHandle.offset(), radix: 10)
+        case .fromResponseHeaders:
             throw IntegrityCheckError.unknown(NSError(domain: "Hash", code: -1, userInfo: [NSLocalizedDescriptionKey: "不支持的哈希类型"]))
         }
     }
 
-    /// 计算 CRC32 哈希值
-    private static func calculateCRC32(for fileHandle: FileHandle) throws -> String {
-        let blockSize = 8192 // 8KB 块大小
-        var data = Data()
-
-        while let chunk = try fileHandle.read(upToCount: blockSize) {
-            data.append(chunk)
-        }
-
-        return CRC32.crc32(data: data)
-    }
-
     /// 计算文件大小
     private static func calculateFileSize(for url: URL) throws -> String {
+        if !url.isFileURL {
+            throw IntegrityCheckError.readError(NSError(domain: "FileSystem", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取文件大小"]))
+        }
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         if let fileSize = attributes[.size] as? Int64 {
             return String(fileSize)

@@ -1,6 +1,6 @@
 import Foundation
 #if canImport(UIKit)
-import UIKit
+    import UIKit
 #endif
 import Combine
 
@@ -87,7 +87,7 @@ public final class BackgroundDownloadManager: NSObject {
 
     // MARK: - 初始化
 
-    private override init() {
+    override private init() {
         super.init()
         setupBackgroundSession()
     }
@@ -96,12 +96,12 @@ public final class BackgroundDownloadManager: NSObject {
 
     /// 配置后台下载
     public func configureBackgroundDownload() {
-    #if canImport(UIKit)
-        // 注册后台任务，仅 iOS 有效
-        UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
-    #else
-        // 非 iOS 平台无操作
-    #endif
+        #if canImport(UIKit)
+            // 注册后台任务，仅 iOS 有效
+            UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+        #else
+            // 非 iOS 平台无操作
+        #endif
     }
 
     /// 创建后台下载任务
@@ -178,9 +178,9 @@ public final class BackgroundDownloadManager: NSObject {
         let configuration = URLSessionConfiguration.background(withIdentifier: "com.downloadmanager.background")
         configuration.isDiscretionary = true
         #if os(iOS) || os(macOS)
-        if #available(iOS 13.0, macOS 11.0, *) {
-            configuration.sessionSendsLaunchEvents = true
-        }
+            if #available(iOS 13.0, macOS 11.0, *) {
+                configuration.sessionSendsLaunchEvents = true
+            }
         #endif
         backgroundSession = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }
