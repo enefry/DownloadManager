@@ -1,6 +1,20 @@
 import Combine
 import Foundation
 
+public struct DownloadProgress {
+    /// 记录时间
+    public let timestamp: TimeInterval
+    /// 已经下载大小
+    public let downloadedBytes: Int64
+    /// 总大小，对于未知下子大小，这个值为-1
+    public let totalBytes: Int64
+    init(timestamp: TimeInterval = Date.now.timeIntervalSince1970, downloadedBytes: Int64, totalBytes: Int64) {
+        self.timestamp = timestamp
+        self.downloadedBytes = downloadedBytes
+        self.totalBytes = totalBytes
+    }
+}
+
 /// 下载任务协议
 public protocol DownloadTaskProtocol: AnyObject, Sendable {
     /// 下载任务的唯一标识符
@@ -24,12 +38,15 @@ public protocol DownloadTaskProtocol: AnyObject, Sendable {
     /// 开始下载时间
     var startTime: TimeInterval { get }
 
+    /// 当前状态
+    var state: DownloadState { get }
+
+    /// 当前进度
+    var progress: DownloadProgress { get }
+
     /// 进度发布者
-    var progressPublisher: AnyPublisher<(Int64, Int64), Never> { get }
+    var progressPublisher: AnyPublisher<DownloadProgress, Never> { get }
 
     /// 状态发布者
     var statePublisher: AnyPublisher<DownloadState, Never> { get }
-
-    /// 下载速度发布者
-    var speedPublisher: AnyPublisher<Double, Never> { get }
 }

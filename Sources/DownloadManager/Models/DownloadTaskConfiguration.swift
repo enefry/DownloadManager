@@ -1,5 +1,5 @@
+import CFNetwork
 import Foundation
-
 /// 下载任务配置协议
 public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable {
     /// 自定义请求头
@@ -39,8 +39,8 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
     /// 网络协议实现
     public var protocolClasses: [String]?
 
-    public struct NetworkProxy: Codable, Copyable, Equatable, Hashable {
-        public struct Pair: Codable, Copyable, Equatable, Hashable {
+    public struct NetworkProxy: Codable, Copyable, Equatable, Hashable, Sendable {
+        public struct Pair: Codable, Copyable, Equatable, Hashable, Sendable {
             let address: String
             let port: Int
         }
@@ -56,14 +56,14 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
                 result[String(kCFNetworkProxiesHTTPPort)] = http.port
             }
             if let https = https {
-                result[String(kCFNetworkProxiesHTTPSEnable)] = true
-                result[String(kCFNetworkProxiesHTTPSProxy)] = https.address
-                result[String(kCFNetworkProxiesHTTPSPort)] = https.port
+                result["HTTPSEnable"] = true
+                result["HTTPSProxy"] = https.address
+                result["HTTPSPort"] = https.port
             }
             if let socks = socks {
-                result[String(kCFNetworkProxiesSOCKSEnable)] = true
-                result[String(kCFNetworkProxiesSOCKSProxy)] = socks.address
-                result[String(kCFNetworkProxiesSOCKSPort)] = socks.port
+                result["SOCKSEnable"] = true
+                result["SOCKSProxy"] = socks.address
+                result["SOCKSPort"] = socks.port
             }
             return result
         }
@@ -120,5 +120,44 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
             configuration.protocolClasses = protocolClasses.compactMap({ NSClassFromString($0) })
         }
         return configuration
+    }
+
+    public init(headers: [String: String] = [:], timeoutIntervalForRequest: TimeInterval? = nil, timeoutIntervalForResource: TimeInterval? = nil, timeoutInterval: TimeInterval? = nil, supportChunkDownload: Bool? = nil, chunkSize: Int64 = 4 * 1024 * 1024, maxConcurrentChunks: Int = 4, priority: Int = 100, allowsBackgroundDownload: Bool? = nil, allowCellularDownloads: Bool? = nil, allowsConstrainedNetworkAccess: Bool? = nil, allowsExpensiveNetworkAccess: Bool? = nil, protocolClasses: [String]? = nil, connectionProxy: NetworkProxy? = nil, retryStrategy: RetryStrategy? = nil, integrityCheck: IntegrityCheckType? = nil) {
+        self.headers = headers
+        self.timeoutIntervalForRequest = timeoutIntervalForRequest
+        self.timeoutIntervalForResource = timeoutIntervalForResource
+        self.timeoutInterval = timeoutInterval
+        self.supportChunkDownload = supportChunkDownload
+        self.chunkSize = chunkSize
+        self.maxConcurrentChunks = maxConcurrentChunks
+        self.priority = priority
+        self.allowsBackgroundDownload = allowsBackgroundDownload
+        self.allowCellularDownloads = allowCellularDownloads
+        self.allowsConstrainedNetworkAccess = allowsConstrainedNetworkAccess
+        self.allowsExpensiveNetworkAccess = allowsExpensiveNetworkAccess
+        self.protocolClasses = protocolClasses
+        self.connectionProxy = connectionProxy
+        self.retryStrategy = retryStrategy
+        self.integrityCheck = integrityCheck
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        headers = try container.decode([String: String].self, forKey: .headers)
+        timeoutIntervalForRequest = try container.decodeIfPresent(TimeInterval.self, forKey: .timeoutIntervalForRequest)
+        timeoutIntervalForResource = try container.decodeIfPresent(TimeInterval.self, forKey: .timeoutIntervalForResource)
+        timeoutInterval = try container.decodeIfPresent(TimeInterval.self, forKey: .timeoutInterval)
+        supportChunkDownload = try container.decodeIfPresent(Bool.self, forKey: .supportChunkDownload)
+        chunkSize = try container.decode(Int64.self, forKey: .chunkSize)
+        maxConcurrentChunks = try container.decode(Int.self, forKey: .maxConcurrentChunks)
+        priority = try container.decode(Int.self, forKey: .priority)
+        allowsBackgroundDownload = try container.decodeIfPresent(Bool.self, forKey: .allowsBackgroundDownload)
+        allowCellularDownloads = try container.decodeIfPresent(Bool.self, forKey: .allowCellularDownloads)
+        allowsConstrainedNetworkAccess = try container.decodeIfPresent(Bool.self, forKey: .allowsConstrainedNetworkAccess)
+        allowsExpensiveNetworkAccess = try container.decodeIfPresent(Bool.self, forKey: .allowsExpensiveNetworkAccess)
+        protocolClasses = try container.decodeIfPresent([String].self, forKey: .protocolClasses)
+        connectionProxy = try container.decodeIfPresent(DownloadTaskConfiguration.NetworkProxy.self, forKey: .connectionProxy)
+        retryStrategy = try container.decodeIfPresent(RetryStrategy.self, forKey: .retryStrategy)
+        integrityCheck = try container.decodeIfPresent(IntegrityCheckType.self, forKey: .integrityCheck)
     }
 }

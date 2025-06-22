@@ -12,18 +12,19 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     public var startTime: TimeInterval
     /// 任务恢复下载时间
     public var resumeTime: TimeInterval
-
     // 源 URL
     public let url: URL
     // 目标 URL
     public let destinationURL: URL
     /// 已经下载大小
-    public private(set) var downloadedBytes: Int64 = 0
+    public var downloadedBytes: Int64 = 0
     /// 总大小，对于未知下子大小，这个值为-1
-    public private(set) var totalBytes: Int64 = -1
+    public var totalBytes: Int64 = -1
+
+    public var progress: DownloadProgress { progressSubject.value }
 
     /// 进度发布者
-    public var progressPublisher: AnyPublisher<(Int64, Int64), Never> {
+    public var progressPublisher: AnyPublisher<DownloadProgress, Never> {
         progressSubject.eraseToAnyPublisher()
     }
 
@@ -51,7 +52,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
 
     /// 发布者的subject
     internal let stateSubject: CurrentValueSubject<DownloadState, Never>
-    internal let progressSubject = CurrentValueSubject<(Int64, Int64), Never>((0, 0))
+    internal let progressSubject = CurrentValueSubject<DownloadProgress, Never>(DownloadProgress(timestamp: 0, downloadedBytes: 0, totalBytes: 0))
     internal let speedSubject = CurrentValueSubject<Double, Never>(0)
 
     /// 订阅的句柄
@@ -124,36 +125,6 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     public static func buildIdentifier(url: URL, destinationURL: URL) -> String {
         return "\(url.absoluteString)\n\(destinationURL.absoluteString)".dm_sha256()
     }
-
-    // MARK: - 公开控制方法
-
-//
-//    public func start() {
-//        Task {
-//            await chunkDownloadManager?.start()
-//        }
-//    }
-//
-//    /// 暂停下载任务
-//    public func pause() {
-//        Task {
-//            await chunkDownloadManager?.pause()
-//        }
-//    }
-//
-//    /// 恢复下载任务
-//    public func resume() {
-//        Task {
-//            await chunkDownloadManager?.resume()
-//        }
-//    }
-//
-//    /// 取消下载任务
-//    public func cancel() {
-//        Task {
-//            await chunkDownloadManager?.cancel()
-//        }
-//    }
 
     /// 获取当前状态
     public var state: DownloadState {

@@ -344,7 +344,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(mockDelegate.progressUpdates.count, 1)
 
         for progress in mockDelegate.progressUpdates {
-            let progressRatio = progress.1 > 0 ? Double(progress.0) / Double(progress.1) : 0.0
+            let progressRatio = progress.totalBytes > 0 ? Double(progress.downloadedBytes) / Double(progress.totalBytes) : 0.0
             XCTAssertTrue(progressRatio >= 0.0 && progressRatio <= 1.0,
                           "Progress ratio should be between 0.0 and 1.0, got \(progressRatio)")
         }
@@ -559,7 +559,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         mockDelegate.onStateUpdate = { state in
             print("State update: \(state)")
             stateSequence.append(state)
-            if state == .downloading{
+            if state == .downloading {
                 downloadingExpectation.fulfill()
             }
             if state.isFailed {
@@ -1260,7 +1260,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
             .appendingPathComponent("nested")
             .appendingPathComponent("directory")
             .appendingPathComponent("file.txt")
-
+        print("dest->\(nestedPath)")
         let nestedDownloadTask = DownloadTask(
             url: testURL,
             destinationURL: nestedPath,
@@ -1531,7 +1531,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
 
         let completeExpectation = XCTestExpectation(description: "Large file download should complete efficiently")
 
-        var progressUpdates: [(bytesReceived: Int64, totalBytes: Int64)] = []
+        var progressUpdates: [DownloadProgress] = []
 
         mockDelegate.onCompletion = { _ in
             completeExpectation.fulfill()
@@ -1593,7 +1593,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
 
         XCTAssertGreaterThan(progressUpdates.count, 1, "Expected multiple progress updates")
         XCTAssertEqual(progressUpdates.last?.totalBytes, Int64(totalFileSize), "Final total bytes should match file size")
-        XCTAssertEqual(progressUpdates.last?.bytesReceived, Int64(totalFileSize), "Should receive all bytes")
+        XCTAssertEqual(progressUpdates.last?.downloadedBytes, Int64(totalFileSize), "Should receive all bytes")
 
         print("Download completed:")
         print("- Time: \(String(format: "%.2f", downloadTime))s")
@@ -1619,8 +1619,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
             expectation.fulfill()
         }
         mockDelegate.onProgressUpdate = { param in
-            let (bytesReceived, totalBytes) = param
-            let progress: Float = totalBytes > 0 ? Float(bytesReceived) / Float(totalBytes) : 0
+            let progress: Float = param.totalBytes > 0 ? Float(param.downloadedBytes) / Float(param.totalBytes) : 0
             progressHistory.append(progress)
         }
 
@@ -1698,8 +1697,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         var progressHistory: [Float] = []
 
         mockDelegate.onProgressUpdate = { param in
-            let (bytesReceived, totalBytes) = param
-            let progress: Float = totalBytes > 0 ? Float(bytesReceived) / Float(totalBytes) : 0
+            let progress: Float = param.totalBytes > 0 ? Float(param.downloadedBytes) / Float(param.totalBytes) : 0
             progressHistory.append(progress)
         }
         mockDownloadTask.taskConfigure.retryStrategy = .none
@@ -1747,40 +1745,40 @@ final class ChunkDownloadManagerTests: XCTestCase {
 
 private class MockChunkDownloadManagerDelegate: ChunkDownloadManagerDelegate {
     var stateUpdates: [DownloadState] = []
-    var progressUpdates: [(Int64, Int64)] = []
+    var progressUpdates: [DownloadProgress] = []
     var lastError: Error?
     var completionURL: URL?
 
     // Callback closures for better test control
     var onStateUpdate: ((DownloadState) -> Void)?
-    var onProgressUpdate: (((Int64, Int64)) -> Void)?
+    var onProgressUpdate: ((DownloadProgress) -> Void)?
     var onProgressDoubleUpdate: ((Double) -> Void)?
     var onError: ((Error) -> Void)?
     var onCompletion: ((URL) -> Void)?
 
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateProgress progress: (Int64, Int64)) {
-        print("progress=>\(progress.0)/\(progress.1)")
-        if progress.0 == -1 && progress.1 == -1 {
+    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
+        completionURL = task.destinationURL
+        onCompletion?(task.url)
+    }
+
+    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
+        print("progress=>\(progress.downloadedBytes)/\(progress.totalBytes)")
+        if progress.downloadedBytes == -1 && progress.totalBytes == -1 {
             print("异常了～")
         }
         progressUpdates.append(progress)
         onProgressUpdate?(progress)
 
-        let progressRatio = progress.1 > 0 ? Double(progress.0) / Double(progress.1) : 0.0
+        let progressRatio = progress.totalBytes > 0 ? Double(progress.downloadedBytes) / Double(progress.totalBytes) : 0.0
         onProgressDoubleUpdate?(progressRatio)
     }
 
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateState state: DownloadState) {
+    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
         stateUpdates.append(state)
         onStateUpdate?(state)
     }
 
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, didCompleteWith task: DownloadTask) {
-        completionURL = task.destinationURL
-        onCompletion?(task.url)
-    }
-
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didFailWithError error: any Error) {
+    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
         lastError = error
         onError?(error)
     }

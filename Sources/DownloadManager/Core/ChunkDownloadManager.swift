@@ -6,29 +6,6 @@ import LoggerProxy
 
 fileprivate let kLogTag = "ChunkDownloadManager"
 
-/// 下载代理
-public protocol ChunkDownloadManagerDelegate: AnyObject, Sendable {
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, didCompleteWith task: DownloadTask)
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateProgress progress: (Int64, Int64))
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didUpdateState state: DownloadState)
-    func chunkDownloadManager(_ manager: ChunkDownloadManager, task: DownloadTask, didFailWithError error: Error)
-}
-
-/// 分块下载配置
-public struct ChunkConfiguration: Sendable {
-    public let chunkSize: Int64
-    public let maxConcurrentChunks: Int
-    public let progressUpdateInterval: TimeInterval
-    public let bufferSize: Int
-
-    public init(chunkSize: Int64, maxConcurrentChunks: Int, progressUpdateInterval: TimeInterval = 0.1, bufferSize: Int = 16 * 1024) {
-        self.chunkSize = chunkSize
-        self.maxConcurrentChunks = maxConcurrentChunks
-        self.progressUpdateInterval = progressUpdateInterval
-        self.bufferSize = bufferSize
-    }
-}
-
 /// 分块任务
 private struct ChunkTask: Sendable {
     let identifier: String
@@ -45,64 +22,14 @@ private struct ChunkTask: Sendable {
     }
 }
 
-/// 分块下载错误
-public enum ChunkDownloadError: Error, LocalizedError, Sendable {
-    case networkError(String)
-    case fileSystemError(String)
-    case serverNotSupported
-    case insufficientDiskSpace
-    case corruptedChunk(String)
-    case invalidResponse
-    case timeout
-    case cancelled
-    case unknown(Error)
-
-    public var errorDescription: String? {
-        switch self {
-        case let .networkError(message):
-            return "网络错误: \(message)"
-        case let .fileSystemError(message):
-            return "文件系统错误: \(message)"
-        case .serverNotSupported:
-            return "服务器不支持分片下载或无法获取文件大小"
-        case .insufficientDiskSpace:
-            return "磁盘空间不足"
-        case let .corruptedChunk(index):
-            return "分片 \(index) 损坏或不完整"
-        case .invalidResponse:
-            return "服务器返回无效响应"
-        case .timeout:
-            return "下载超时"
-        case .cancelled:
-            return "下载已取消"
-        case let .unknown(error):
-            return "未知错误: \(error.localizedDescription)"
-        }
-    }
-
-    public var errorCode: Int {
-        switch self {
-        case .networkError: return 0x2001
-        case .fileSystemError: return 0x2002
-        case .serverNotSupported: return 0x2003
-        case .insufficientDiskSpace: return 0x2004
-        case .corruptedChunk: return 0x2005
-        case .invalidResponse: return 0x2006
-        case .timeout: return 0x2007
-        case .cancelled: return 0x2008
-        case .unknown: return 0x20FF
-        }
-    }
-}
-
 /// 合并后的下载管理器 Actor
-public actor ChunkDownloadManager {
+public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolated
     /// 下载任务
     private let downloadTask: DownloadTask
     /// 分块配置
     private let configuration: ChunkConfiguration
     /// 下载session
-    private let session: URLSession
+    private var session: URLSession
     /// 并发任务存储
     private let activeTasks = ConcurrentDictionary<String, Task<Void, Never>>()
     /// 分块任务
@@ -122,7 +49,7 @@ public actor ChunkDownloadManager {
     /// 检查过可以分块
     public var chunkAvailable: Bool = false
     /// 更新进度
-    private func update(progress: (Int64, Int64)) {
+    private func update(progress: DownloadProgress) {
         downloadTask.progressSubject.send(progress)
         delegate?.chunkDownloadManager(self, task: downloadTask, didUpdateProgress: progress)
     }
@@ -192,7 +119,9 @@ public actor ChunkDownloadManager {
             guard state.canResume else { return }
             LoggerProxy.ILog(tag: kLogTag, msg: "恢复chunk文件下载")
             update(state: .downloading)
-            checkAndStartAvailableChunksDownload()
+            Task{
+                await checkAndStartAvailableChunksDownload()
+            }
         } else if state == .paused,
                   activeTasks.keys().contains(where: { $0 == downloadTask.identifier }) {
             LoggerProxy.ILog(tag: kLogTag, msg: "恢复普通文件下载")
@@ -295,16 +224,17 @@ public actor ChunkDownloadManager {
         }
 
         if totalBytes > 0 {
-            update(progress: (totalDownloaded, totalBytes))
+            update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: totalBytes))
         } else {
-            update(progress: (totalDownloaded, -1))
+            update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: -1))
         }
     }
 
     /// 获取到完整大小，这时候更新一次进度
     private func updateTotalBytes(_ bytes: Int64) {
         totalBytes = bytes
-        update(progress: (0, totalBytes))
+        downloadTask.totalBytes = totalBytes
+        update(progress: DownloadProgress(downloadedBytes: 0, totalBytes: bytes))
     }
 
     /// 更新分块进度
@@ -318,14 +248,16 @@ public actor ChunkDownloadManager {
     }
 
     private func updateProgressIfNeeded() {
+        let totalDownloaded = taskDownloadedBytes.values.reduce(0, +)
+        downloadTask.downloadedBytes = totalDownloaded
+
         let now = Date()
         guard now.timeIntervalSince(lastProgressUpdate) >= configuration.progressUpdateInterval else { return }
         lastProgressUpdate = now
 
-        let totalDownloaded = taskDownloadedBytes.values.reduce(0, +)
         guard totalBytes > 0 else { return }
 
-        update(progress: (totalDownloaded, totalBytes))
+        update(progress: DownloadProgress(timestamp: now.timeIntervalSinceNow, downloadedBytes: totalDownloaded, totalBytes: totalBytes))
     }
 
     private func updateChunkStatus(at index: Int, completed: Bool, downloadedBytes: Int64) {
@@ -468,7 +400,7 @@ public actor ChunkDownloadManager {
             try createTempDirectory() // 直接调用，不需要 await
             createChunkTasks() // 直接调用，不需要 await
             update(state: .downloading) // 直接调用，不需要 await
-            checkAndStartAvailableChunksDownload()
+            await checkAndStartAvailableChunksDownload()
         } catch {
             let chunkError: ChunkDownloadError
             if let ce = error as? ChunkDownloadError {
@@ -491,7 +423,7 @@ public actor ChunkDownloadManager {
         activeTasks[taskKey] = task
     }
 
-    private func checkAndStartAvailableChunksDownload() {
+    private func checkAndStartAvailableChunksDownload() async {
         LoggerProxy.DLog(tag: kLogTag, msg: "startNextAvailableChunks")
 
         // 下载中，准备中，才会开始下载新的分块
@@ -500,9 +432,15 @@ public actor ChunkDownloadManager {
         let chunksToStart = getNextAvailableChunks(maxCount: configuration.maxConcurrentChunks) // 直接调用
 
         LoggerProxy.DLog(tag: kLogTag, msg: "startNextAvailableChunks,chunksToStart=\(chunksToStart.count)")
-
-        for chunk in chunksToStart {
-            downloadChunk(chunk)
+        if chunksToStart.isEmpty {
+            let allCompleted = chunkTasks.allSatisfy { $0.isCompleted }
+            if allCompleted {
+                await mergeChunks()
+            }
+        } else {
+            for chunk in chunksToStart {
+                downloadChunk(chunk)
+            }
         }
     }
 
@@ -661,6 +599,9 @@ public actor ChunkDownloadManager {
         var downloadedBytes: Int64 = chunk.downloadedBytes
         let identifier = chunk.identifier
         do {
+            if state == .cancelled {
+                return
+            }
             let (bytes, response) = try await session.bytes(for: request)
             try Task.checkCancellation()
 
@@ -764,7 +705,7 @@ public actor ChunkDownloadManager {
         if allCompleted {
             await mergeChunks()
         } else {
-            checkAndStartAvailableChunksDownload()
+            await checkAndStartAvailableChunksDownload()
         }
     }
 
@@ -794,8 +735,12 @@ public actor ChunkDownloadManager {
         if FileManager.default.fileExists(atPath: tempMergeFile.path) {
             try FileManager.default.removeItem(at: tempMergeFile)
         }
-
-        try checkDiskSpace(requiredSpace: totalBytes, destinationURL: downloadTask.destinationURL)
+        let dir = downloadTask.destinationURL.deletingLastPathComponent()
+            
+        if !FileManager.default.fileExists(atPath: downloadTask.destinationURL.deletingLastPathComponent().path){
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        try checkDiskSpace(requiredSpace: totalBytes, destinationURL: dir)
 
         // 校验分块文件大小是否都是预期的
         for chunkTask in chunkTasks {
@@ -859,7 +804,8 @@ public actor ChunkDownloadManager {
         } else {
             fullSize = taskDownloadedBytes.values.reduce(0, +)
         }
-        update(progress: (fullSize, fullSize))
+
+        update(progress: DownloadProgress(downloadedBytes: fullSize, totalBytes: fullSize))
         update(state: .completed) // 直接调用，不需要 await
     }
 
@@ -900,5 +846,6 @@ public actor ChunkDownloadManager {
             }
         }
         session.invalidateAndCancel()
+        session = URLSession.shared
     }
 }

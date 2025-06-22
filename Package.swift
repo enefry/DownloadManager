@@ -30,6 +30,19 @@ let package = Package(
                 .process("Resources")
             ]
         ),
+        .target(
+            name: "DownloadManagerUI",
+            dependencies: [
+                .target(name: "DownloadManager"),
+                .productItem(name: "ConcurrencyCollection",package: "ConcurrencyCollection"),
+                .productItem(name: "LoggerProxy",package: "LoggerProxy"),
+                .productItem(name: "Atomics",package: "swift-atomics"),
+            ],
+            path: "UI",
+            resources: [
+                .process("Resources")
+            ]
+        ),
         .testTarget(
             name: "DownloadManagerTests",
             dependencies: ["DownloadManager"],

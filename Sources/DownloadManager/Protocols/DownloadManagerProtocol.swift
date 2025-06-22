@@ -3,7 +3,7 @@ import ConcurrencyCollection
 import Foundation
 
 /// 下载管理器协议
-public protocol DownloadManagerProtocol: AnyObject {
+public protocol DownloadManagerProtocol {
     /// 获取所有下载任务
     var allTasks: [any DownloadTaskProtocol] { get }
 
@@ -22,7 +22,9 @@ public protocol DownloadManagerProtocol: AnyObject {
     ///   - destination: 目标保存路径
     ///   - configuration: 下载配置
     /// - Returns: 下载任务
-    func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?) -> DownloadTaskProtocol
+    func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?) async -> DownloadTaskProtocol
+
+    func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?, completion: ((any DownloadTaskProtocol) -> Void)?)
 
     /// 获取指定ID的下载任务
     /// - Parameter identifier: 任务ID
@@ -84,4 +86,12 @@ public protocol DownloadManagerProtocol: AnyObject {
     /// 等待所有任务完成
     /// - Throws: 下载过程中的错误
     func waitForAllTasks() async throws
+
+    /// 初始化后等待启动
+    func waitForStartup() async
+}
+
+public func CreateDownloadManager(withConfigure configure: DownloadManagerConfiguration? = nil) -> DownloadManagerProtocol {
+    let configure = configure ?? DownloadManagerConfiguration()
+    return DownloadManager(configuration: configure)
 }

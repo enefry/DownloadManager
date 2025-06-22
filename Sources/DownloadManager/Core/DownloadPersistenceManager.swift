@@ -1,7 +1,13 @@
 import Foundation
 
 /// 下载持久化管理器
-final class DownloadPersistenceManager {
+public class DownloadPersistenceManager: DownloadPersistenceManagerProtocol, @unchecked Sendable {
+    var workingDirectoryName: String = "DownloadManager"
+    public func setup(configure: DownloadManagerConfiguration) async {
+        workingDirectoryName = "DownloadManager-\(configure.name)"
+        createDirectoryIfNeeded()
+    }
+
     // MARK: - 私有属性
 
     private let fileManager = FileManager.default
@@ -9,44 +15,54 @@ final class DownloadPersistenceManager {
 
     private var persistenceURL: URL {
         let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsPath.appendingPathComponent("DownloadManager")
+        return documentsPath.appendingPathComponent(workingDirectoryName)
             .appendingPathComponent("tasks.json")
-    }
-
-    // MARK: - 初始化
-
-    init() {
-        createDirectoryIfNeeded()
     }
 
     // MARK: - 公开方法
 
-    func saveTasks(_ tasks: [DownloadTask]) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            do {
-                let data = try JSONEncoder().encode(tasks)
-                try data.write(to: self.persistenceURL)
-            } catch {
-                print("保存下载任务失败: \(error)")
+    public func saveTasks(_ tasks: [DownloadTask]) async throws {
+        try await withCheckedThrowingContinuation { [weak self] cc in
+            self?.queue.async {
+                guard let self = self else { return }
+                do {
+                    let data = try JSONEncoder().encode(tasks)
+                    try data.write(to: self.persistenceURL)
+                    cc.resume(returning: ())
+                } catch {
+                    print("保存下载任务失败: \(error)")
+                    cc.resume(throwing: error)
+                }
             }
         }
     }
 
-    func loadTasks() -> [DownloadTask] {
-        queue.sync {
-            guard let data = try? Data(contentsOf: persistenceURL),
-                  let tasks = try? JSONDecoder().decode([DownloadTask].self, from: data) else {
-                return []
+    public func loadTasks() async throws -> [DownloadTask] {
+        try await withCheckedThrowingContinuation { [weak self] cc in
+            self?.queue.sync {
+                do {
+                    guard let self = self else { return }
+                    let data = try Data(contentsOf: self.persistenceURL)
+                    let tasks = try JSONDecoder().decode([DownloadTask].self, from: data)
+                    cc.resume(returning: tasks)
+                } catch {
+                    cc.resume(throwing: error)
+                }
             }
-            return tasks
         }
     }
 
-    func clearTasks() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            try? self.fileManager.removeItem(at: self.persistenceURL)
+    public func clearTasks() async throws {
+        try await withCheckedThrowingContinuation { [weak self] cc in
+            self?.queue.async {
+                do {
+                    guard let self = self else { return }
+                    try self.fileManager.removeItem(at: self.persistenceURL)
+                    cc.resume(returning: ())
+                } catch {
+                    cc.resume(throwing: error)
+                }
+            }
         }
     }
 

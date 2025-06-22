@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 /// 重试策略
-public enum RetryStrategy: Codable, Equatable, Hashable {
+public enum RetryStrategy: Codable, Equatable, Hashable, Sendable {
     /// 固定间隔重试
     case fixed(interval: TimeInterval, maxAttempts: Int)
     /// 指数退避重试

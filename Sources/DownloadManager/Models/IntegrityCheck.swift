@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// 文件完整性校验类型
-public enum IntegrityCheckType: String, Codable {
+public enum IntegrityCheckType: String, Codable, Sendable {
     /// MD5 校验
     case md5
     /// SHA1 校验
