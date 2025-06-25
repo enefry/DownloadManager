@@ -9,6 +9,6 @@
 2. DownloadTask 主要作用是记录下载信息，通知下载状态更新和进度更新
 3. DownloadManager 创建 DownloadTask后会保存到队列，并通过DownloadPersistenceManager进行持久化保存。
 4. DownloadManager 包含一个下载队列调度器，调度会根据 DownloadManagerConfiguration 中的并发控制，调度开始下载任务
-5. DownloadManager 通过 ChunkDownloadManager 下载 DownloadTask 并监听回调，更新 DownloadTask 状态和进度
-6. DownloadManager 会在 ChunkDownloadManager 报告错误后，通过RetryStrategy决策是否再次重试，并重新调度任务
+5. DownloadManager 通过 HTTPChunkDownloadManager 下载 DownloadTask 并监听回调，更新 DownloadTask 状态和进度
+6. DownloadManager 会在 HTTPChunkDownloadManager 报告错误后，通过RetryStrategy决策是否再次重试，并重新调度任务
 7. 注意线程安全

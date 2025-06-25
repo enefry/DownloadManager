@@ -22,7 +22,7 @@ public enum NetworkStatus {
     case connected(NetworkType)
     case disconnected
     case restricted
-}
+}   
 
 public protocol NetworkMonitorProtocol {
     var status: NetworkStatus { get }

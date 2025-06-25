@@ -35,37 +35,46 @@ public protocol DownloadManagerProtocol {
     /// - Parameter url: 任务的URL
     /// - Returns: 下载任务，如果不存在则返回nil
     func task(withURL url: URL) -> DownloadTaskProtocol?
-
-    /// 删除指定ID的下载任务
-    /// - Parameter url: 任务的URL
-    func remove(withURL url: URL)
-
-    // MARK: - Task 操作
-
+    
     // 暂停任务
+    /// - Parameter task: 任务
     func pause(task: DownloadTaskProtocol)
     // 暂停任务
+    /// - Parameter identifier: 任务ID
     func pause(withIdentifier: String)
     /// 恢复任务
+    /// - Parameter task: 任务
     func resume(task: DownloadTaskProtocol)
     /// 恢复任务
+    /// - Parameter identifier: 任务ID
     func resume(withIdentifier: String)
-
     /// 停止任务
+    /// - Parameter task: 任务
     func cancel(task: DownloadTaskProtocol)
     /// 停止任务
+    /// - Parameter identifier: 任务ID
     func cancel(withIdentifier: String)
-
     /// 删除任务
+    /// - Parameter task: 任务
     func remove(task: DownloadTaskProtocol)
     /// 删除指定ID的下载任务
     /// - Parameter identifier: 任务ID
     func remove(withIdentifier identifier: String)
-
     /// 插入优先任务
+    /// - Parameter task: 任务
     func insert(task: DownloadTaskProtocol)
+    /// 插入优先任务
+    /// - Parameter identifier: 任务ID
     func insert(withIdentifier: String)
+    /// 重新优先任务
+    /// - Parameter task: 任务
+    func restart(task: DownloadTaskProtocol)
+    /// 插入优先任务
+    /// - Parameter identifier: 任务ID
+    func restart(withIdentifier: String)
 
+    
+    
     // MARK: - 批量操作
 
     /// 暂停所有下载任务

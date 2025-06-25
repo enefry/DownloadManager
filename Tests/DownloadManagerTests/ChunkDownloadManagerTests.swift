@@ -6,11 +6,11 @@ import XCTest
 final class ChunkDownloadManagerTests: XCTestCase {
     // MARK: - Test Properties
 
-    private var downloadManager: ChunkDownloadManager!
-    private var mockDelegate: MockChunkDownloadManagerDelegate!
+    private var downloadManager: HTTPChunkDownloadManager!
+    private var mockDelegate: MockHTTPChunkDownloadManagerDelegate!
     private var mockDownloadTask: DownloadTask!
     private var downloadTaskConfiguration: DownloadTaskConfiguration!
-    private var mockConfiguration: ChunkConfiguration!
+    private var mockConfiguration: HTTPChunkDownloadConfiguration!
 
     private let testURL = URL(string: "https://example.com/test.file")!
     private let testData = "Test data".data(using: .utf8)!
@@ -37,16 +37,16 @@ final class ChunkDownloadManagerTests: XCTestCase {
         )
 
         // Create mock configuration
-        mockConfiguration = ChunkConfiguration(
+        mockConfiguration = HTTPChunkDownloadConfiguration(
             chunkSize: 1024 * 1024, // 1MB
             maxConcurrentChunks: 3
         )
 
         // Create mock delegate
-        mockDelegate = MockChunkDownloadManagerDelegate()
+        mockDelegate = MockHTTPChunkDownloadManagerDelegate()
 
         // Create download manager
-        downloadManager = ChunkDownloadManager(
+        downloadManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: mockConfiguration,
             delegate: mockDelegate
@@ -881,8 +881,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
         try? await Task.sleep(nanoseconds: UInt64(kMillisecondScale) * 10)
         // 重新设置进行恢复测试
         isFirstDownload = false
-        mockDelegate = MockChunkDownloadManagerDelegate()
-        downloadManager = ChunkDownloadManager(
+        mockDelegate = MockHTTPChunkDownloadManagerDelegate()
+        downloadManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: mockConfiguration,
             delegate: mockDelegate
@@ -919,12 +919,12 @@ final class ChunkDownloadManagerTests: XCTestCase {
         print("\(#function):\(#line)")
 
         // Test with minimum chunk size
-        let minConfig = ChunkConfiguration(
+        let minConfig = HTTPChunkDownloadConfiguration(
             chunkSize: 1024, // 1KB
             maxConcurrentChunks: 1
         )
 
-        let minManager = ChunkDownloadManager(
+        let minManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: minConfig,
             delegate: mockDelegate
@@ -933,12 +933,12 @@ final class ChunkDownloadManagerTests: XCTestCase {
         XCTAssertNotNil(minManager)
 
         // Test with maximum chunk size
-        let maxConfig = ChunkConfiguration(
+        let maxConfig = HTTPChunkDownloadConfiguration(
             chunkSize: 100 * 1024 * 1024, // 100MB
             maxConcurrentChunks: 10
         )
 
-        let maxManager = ChunkDownloadManager(
+        let maxManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: maxConfig,
             delegate: mockDelegate
@@ -1057,8 +1057,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
                 destinationURL: createUniqueDestinationURL(),
                 configuration: downloadTaskConfiguration
             )
-            let uniqueDelegate = MockChunkDownloadManagerDelegate()
-            let uniqueManager = ChunkDownloadManager(
+            let uniqueDelegate = MockHTTPChunkDownloadManagerDelegate()
+            let uniqueManager = HTTPChunkDownloadManager(
                 downloadTask: uniqueTask,
                 configuration: mockConfiguration,
                 delegate: uniqueDelegate
@@ -1104,8 +1104,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
                 destinationURL: createUniqueDestinationURL(),
                 configuration: downloadTaskConfiguration
             )
-            let uniqueDelegate = MockChunkDownloadManagerDelegate()
-            let uniqueManager = ChunkDownloadManager(
+            let uniqueDelegate = MockHTTPChunkDownloadManagerDelegate()
+            let uniqueManager = HTTPChunkDownloadManager(
                 downloadTask: uniqueTask,
                 configuration: mockConfiguration,
                 delegate: uniqueDelegate
@@ -1132,12 +1132,12 @@ final class ChunkDownloadManagerTests: XCTestCase {
     func testSmallChunkSize() async {
         print("\(#function):\(#line)")
 
-        let smallChunkConfig = ChunkConfiguration(
+        let smallChunkConfig = HTTPChunkDownloadConfiguration(
             chunkSize: 100,
             maxConcurrentChunks: 8,
         )
         mockDownloadTask.taskConfigure.timeoutIntervalForRequest = 20
-        let smallChunkManager = ChunkDownloadManager(
+        let smallChunkManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: smallChunkConfig,
             delegate: mockDelegate
@@ -1169,12 +1169,12 @@ final class ChunkDownloadManagerTests: XCTestCase {
     func testLargeChunkSize() async {
         print("\(#function):\(#line)")
 
-        let largeChunkConfig = ChunkConfiguration(
+        let largeChunkConfig = HTTPChunkDownloadConfiguration(
             chunkSize: 50 * 1024 * 1024, // 50MB chunks
             maxConcurrentChunks: 1
         )
 
-        let largeChunkManager = ChunkDownloadManager(
+        let largeChunkManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: largeChunkConfig,
             delegate: mockDelegate
@@ -1204,7 +1204,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         let concurrencyLevels = [1, 2, 5, 10]
 
         for maxConcurrent in concurrencyLevels {
-            let config = ChunkConfiguration(
+            let config = HTTPChunkDownloadConfiguration(
                 chunkSize: 512 * 1024, // 512KB
                 maxConcurrentChunks: maxConcurrent
             )
@@ -1214,8 +1214,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
                 destinationURL: createUniqueDestinationURL(),
                 configuration: downloadTaskConfiguration
             )
-            let uniqueDelegate = MockChunkDownloadManagerDelegate()
-            let manager = ChunkDownloadManager(
+            let uniqueDelegate = MockHTTPChunkDownloadManagerDelegate()
+            let manager = HTTPChunkDownloadManager(
                 downloadTask: uniqueTask,
                 configuration: config,
                 delegate: uniqueDelegate
@@ -1267,7 +1267,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
             configuration: downloadTaskConfiguration
         )
 
-        let nestedManager = ChunkDownloadManager(
+        let nestedManager = HTTPChunkDownloadManager(
             downloadTask: nestedDownloadTask,
             configuration: mockConfiguration,
             delegate: mockDelegate
@@ -1401,13 +1401,13 @@ final class ChunkDownloadManagerTests: XCTestCase {
             "X-Custom-Header": "custom-value",
         ]
 
-        let configWithHeaders = ChunkConfiguration(
+        let configWithHeaders = HTTPChunkDownloadConfiguration(
             chunkSize: mockConfiguration.chunkSize,
             maxConcurrentChunks: mockConfiguration.maxConcurrentChunks
         )
         mockDownloadTask.taskConfigure.headers = customHeaders
 
-        let managerWithHeaders = ChunkDownloadManager(
+        let managerWithHeaders = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: configWithHeaders,
             delegate: mockDelegate
@@ -1435,7 +1435,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
             timeoutIntervalForResource: 1,
             protocolClasses: [NSStringFromClass(MockURLProtocol.self)]
         )
-        let shortTimeoutConfig = ChunkConfiguration(
+        let shortTimeoutConfig = HTTPChunkDownloadConfiguration(
             chunkSize: mockConfiguration.chunkSize,
             maxConcurrentChunks: mockConfiguration.maxConcurrentChunks
         )
@@ -1446,7 +1446,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
             configuration: taskConfigure
         )
 
-        let timeoutManager = ChunkDownloadManager(
+        let timeoutManager = HTTPChunkDownloadManager(
             downloadTask: timeoutTask,
             configuration: shortTimeoutConfig,
             delegate: mockDelegate
@@ -1477,7 +1477,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
     func testDownloadManagerDeallocation() async {
         print("\(#function):\(#line)")
 
-        var manager: ChunkDownloadManager? = ChunkDownloadManager(
+        var manager: HTTPChunkDownloadManager? = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: mockConfiguration,
             delegate: mockDelegate
@@ -1701,8 +1701,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
             progressHistory.append(progress)
         }
         mockDownloadTask.taskConfigure.retryStrategy = .none
-        mockConfiguration = ChunkConfiguration(chunkSize: Int64(chunkSize), maxConcurrentChunks: 2)
-        downloadManager = ChunkDownloadManager(
+        mockConfiguration = HTTPChunkDownloadConfiguration(chunkSize: Int64(chunkSize), maxConcurrentChunks: 2)
+        downloadManager = HTTPChunkDownloadManager(
             downloadTask: mockDownloadTask,
             configuration: mockConfiguration,
             delegate: mockDelegate
@@ -1743,7 +1743,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
 
 // MARK: - Mock Classes
 
-private class MockChunkDownloadManagerDelegate: ChunkDownloadManagerDelegate {
+private class MockHTTPChunkDownloadManagerDelegate: HTTPChunkDownloadManagerDelegate {
     var stateUpdates: [DownloadState] = []
     var progressUpdates: [DownloadProgress] = []
     var lastError: Error?
@@ -1756,12 +1756,12 @@ private class MockChunkDownloadManagerDelegate: ChunkDownloadManagerDelegate {
     var onError: ((Error) -> Void)?
     var onCompletion: ((URL) -> Void)?
 
-    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
         completionURL = task.destinationURL
         onCompletion?(task.url)
     }
 
-    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
         print("progress=>\(progress.downloadedBytes)/\(progress.totalBytes)")
         if progress.downloadedBytes == -1 && progress.totalBytes == -1 {
             print("异常了～")
@@ -1773,12 +1773,12 @@ private class MockChunkDownloadManagerDelegate: ChunkDownloadManagerDelegate {
         onProgressDoubleUpdate?(progressRatio)
     }
 
-    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
         stateUpdates.append(state)
         onStateUpdate?(state)
     }
 
-    func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
         lastError = error
         onError?(error)
     }

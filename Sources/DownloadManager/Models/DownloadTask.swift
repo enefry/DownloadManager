@@ -1,26 +1,62 @@
+import Atomics
 import Combine
+import DownloadManagerBasic
 import Foundation
 
-public final class DownloadTask: DownloadTaskProtocol, Codable {
+@propertyWrapper
+public struct DMAtomicInteger<Value: AtomicValue & FixedWidthInteger>: @unchecked Sendable where Value.AtomicRepresentation.Value == Value {
+    private var atomValue: ManagedAtomic<Value>
+
+    public var wrappedValue: Value {
+        get { atomValue.load(ordering: .acquiring) }
+        set { atomValue.store(newValue, ordering: .releasing) }
+    }
+
+    public init(wrappedValue: Value) {
+        atomValue = ManagedAtomic(wrappedValue)
+    }
+}
+
+/**
+ * 下载任务，记录一个具体下载任务的配置
+ */
+public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Sendable, Equatable {
+    public static func == (lhs: DownloadTask, rhs: DownloadTask) -> Bool {
+        lhs.identifier == rhs.identifier
+    }
+
     // MARK: - 公开属性
 
     /// 唯一标识，其实就是源URL+目标URL的 hash
     public let identifier: String
+
     /// 任务配置，必须存在
-    public var taskConfigure: DownloadTaskConfiguration
+    public let taskConfigure: DownloadTaskConfiguration
+
     /// 任务添加时间
-    public var startTime: TimeInterval
+    public let startTime: TimeInterval
+
     /// 任务恢复下载时间
-    public var resumeTime: TimeInterval
+
+    @DMAtomicInteger
+    public var resumeTime: Int64
+
     // 源 URL
     public let url: URL
+
     // 目标 URL
     public let destinationURL: URL
-    /// 已经下载大小
-    public var downloadedBytes: Int64 = 0
-    /// 总大小，对于未知下子大小，这个值为-1
-    public var totalBytes: Int64 = -1
 
+    /// 已经下载大小
+
+    @DMAtomicInteger
+    public var downloadedBytes: Int64
+
+    /// 总大小，对于未知下子大小，这个值为-1
+    @DMAtomicInteger
+    public var totalBytes: Int64
+
+    // 进度
     public var progress: DownloadProgress { progressSubject.value }
 
     /// 进度发布者
@@ -29,7 +65,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     }
 
     /// 状态发布者
-    public var statePublisher: AnyPublisher<DownloadState, Never> {
+    public var statePublisher: AnyPublisher<TaskState, Never> {
         stateSubject.eraseToAnyPublisher()
     }
 
@@ -40,23 +76,23 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
 
     // MARK: - 私有属性
 
-    // 内部配置
-
-    /// 分片下载管理，每个下载任务一个分片管理器
-//    internal weak var chunkDownloadManager: ChunkDownloadManager?
-
-    /// 统计下载速度定时器
-    internal var speedTimer: Timer?
-    /// 最后下载大小
-    internal var lastDownloadedBytes: Int64 = 0
-
     /// 发布者的subject
-    internal let stateSubject: CurrentValueSubject<DownloadState, Never>
-    internal let progressSubject = CurrentValueSubject<DownloadProgress, Never>(DownloadProgress(timestamp: 0, downloadedBytes: 0, totalBytes: 0))
-    internal let speedSubject = CurrentValueSubject<Double, Never>(0)
+    private let stateSubject: CurrentValueSubject<TaskState, Never>
+    public func update(state: TaskState) async {
+        stateSubject.send(state)
+    }
 
-    /// 订阅的句柄
-    private var cancellables = Set<AnyCancellable>()
+    /// 进度发布者subject
+    private let progressSubject = CurrentValueSubject<DownloadProgress, Never>(DownloadProgress(timestamp: 0, downloadedBytes: 0, totalBytes: 0))
+    public func update(progress: DownloadProgress) async {
+        progressSubject.send(progress)
+    }
+
+    /// 速度发布者subject
+    private let speedSubject = CurrentValueSubject<Double, Never>(0)
+    public func update(speed: Double) {
+        speedSubject.send(speed)
+    }
 
     // MARK: - Codable
 
@@ -78,14 +114,13 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
         identifier = try container.decode(String.self, forKey: .identifier)
         taskConfigure = try container.decode(DownloadTaskConfiguration.self, forKey: .taskConfigure)
         startTime = try container.decode(TimeInterval.self, forKey: .startTime)
-        resumeTime = try container.decode(TimeInterval.self, forKey: .resumeTime)
+        resumeTime = try container.decode(Int64.self, forKey: .resumeTime)
         url = try container.decode(URL.self, forKey: .url)
         destinationURL = try container.decode(URL.self, forKey: .destinationURL)
         downloadedBytes = try container.decode(Int64.self, forKey: .downloadedBytes)
         totalBytes = try container.decode(Int64.self, forKey: .totalBytes)
-
-        let state = try container.decode(DownloadState.self, forKey: .state)
-        stateSubject = CurrentValueSubject<DownloadState, Never>(state)
+        let state = try container.decode(TaskState.self, forKey: .state)
+        stateSubject = CurrentValueSubject<TaskState, Never>(state)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -119,7 +154,9 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
         )
         startTime = Date().timeIntervalSince1970
         resumeTime = 0
-        stateSubject = CurrentValueSubject<DownloadState, Never>(.initialed)
+        stateSubject = CurrentValueSubject<TaskState, Never>(.pending)
+        downloadedBytes = 0
+        totalBytes = -1
     }
 
     public static func buildIdentifier(url: URL, destinationURL: URL) -> String {
@@ -127,10 +164,30 @@ public final class DownloadTask: DownloadTaskProtocol, Codable {
     }
 
     /// 获取当前状态
-    public var state: DownloadState {
+    public var state: TaskState {
         stateSubject.value
     }
 
     /// 重试次数
     public var retryCount: Int = 0
+}
+
+extension DownloadTask {
+    func downloadProtocol() -> ProtocolType? {
+        if let scheme = url.scheme?.lowercased() {
+            switch scheme {
+            case "http", "https":
+                return .http
+            case "ftp", "ftps":
+                return .ftp
+            case "smb", "samba":
+                return .samba
+            case "magnet":
+                return .magnet
+            default:
+                return .init(rawValue: scheme)
+            }
+        }
+        return nil
+    }
 }

@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import Network
 
-public class NetworkMonitor: NetworkMonitorProtocol {
+public class NetworkMonitor: NetworkMonitorProtocol, @unchecked Sendable {
     // MARK: - 公开属性
 
     public private(set) var status: NetworkStatus {

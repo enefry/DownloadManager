@@ -1,43 +1,56 @@
 import Combine
 import ConcurrencyCollection
 import CryptoKit
+import DownloadManagerBasic
 import Foundation
 import LoggerProxy
 
-fileprivate let kLogTag = "ChunkDownloadManager"
-
-/// 分块任务
-private struct ChunkTask: Sendable {
-    let identifier: String
-    let index: Int
-    let downloadTask: any DownloadTaskProtocol
-    let start: Int64
-    let end: Int64
-    var downloadedBytes: Int64
-    var filePath: URL
-    var isCompleted: Bool
-
-    var totalChunkSize: Int64 {
-        end - start + 1
-    }
-}
+fileprivate let kLogTag = "HTTPChunkDownloadManager"
 
 /// 合并后的下载管理器 Actor
-public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolated
+public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisolated
+    /// 任务信息
+    private struct TaskInfo: Codable, Sendable, Equatable, Hashable {
+        var src: String
+        var dest: String
+        var identifier: String
+        var chunkAvailable: Bool?
+        var totalBytes: Int64 = 0
+    }
+
+    /// 分块任务
+    private struct Chunk: Sendable {
+        let identifier: String
+        let index: Int
+        let downloadTask: any HTTPChunkDownloadTaskProtocol
+        let start: Int64
+        let end: Int64
+        var downloadedBytes: Int64
+        var filePath: URL
+        var isCompleted: Bool
+
+        var totalChunkSize: Int64 {
+            end - start + 1
+        }
+    }
+
+    /// 当前下载任务的信息，用于记录内部状态
+    private var taskInfoSavePath: URL
+    private var taskInfo: TaskInfo
     /// 下载任务
-    private let downloadTask: DownloadTask
+    private let downloadTask: any HTTPChunkDownloadTaskProtocol
     /// 分块配置
-    private let configuration: ChunkConfiguration
+    private let configuration: HTTPChunkDownloadConfiguration
     /// 下载session
     private var session: URLSession
     /// 并发任务存储
     private let activeTasks = ConcurrentDictionary<String, Task<Void, Never>>()
     /// 分块任务
-    private var chunkTasks: [ChunkTask] = []
+    private var chunkTasks: [Chunk] = []
     /// 正在下载的分块
     private var activeTaskIndices: Set<String> = []
     /// 下载的临时目录，完成后会删除
-    private var tempDirectory: URL?
+    private var tempDirectory: URL
     /// 完整大小
     private var totalBytes: Int64 = -1
     /// 已经下载的大小
@@ -45,42 +58,53 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
     /// 上一次进度更新时间
     private var lastProgressUpdate: Date = .distantPast
     /// 当前下载器状态，不直接关联task，避免被多个task关联
-    public var state: DownloadState = .initialed
+    @Published public var state: ChunkDownloadState = .initialed
     /// 检查过可以分块
     public var chunkAvailable: Bool = false
+
     /// 更新进度
-    private func update(progress: DownloadProgress) {
-        downloadTask.progressSubject.send(progress)
-        delegate?.chunkDownloadManager(self, task: downloadTask, didUpdateProgress: progress)
+    private func update(progress: DownloadProgress) async {
+        await delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateProgress: progress)
     }
 
     /// 更新状态
-    private func update(state: DownloadState) {
+    private func update(state: ChunkDownloadState) async {
         LoggerProxy.DLog(tag: kLogTag, msg: "update(state:\(state))")
         self.state = state
-        downloadTask.stateSubject.send(state)
-        delegate?.chunkDownloadManager(self, task: downloadTask, didUpdateState: state)
+        await delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateState: state)
         if case .completed = state {
-            delegate?.chunkDownloadManager(self, didCompleteWith: downloadTask)
+            await delegate?.HTTPChunkDownloadManager(self, didCompleteWith: downloadTask)
         } else if case let .failed(downloadError) = state {
-            delegate?.chunkDownloadManager(self, task: downloadTask, didFailWithError: downloadError)
+            await delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didFailWithError: downloadError)
         }
     }
 
-    private weak var delegate: ChunkDownloadManagerDelegate?
+    private weak var delegate: HTTPChunkDownloadManagerDelegate?
     var cancellable: [AnyCancellable] = []
 
     // MARK: - 初始化
 
-    public init(downloadTask: DownloadTask, configuration: ChunkConfiguration, delegate: ChunkDownloadManagerDelegate) {
+    public init(downloadTask: any HTTPChunkDownloadTaskProtocol, configuration: HTTPChunkDownloadConfiguration, delegate: HTTPChunkDownloadManagerDelegate) {
         self.downloadTask = downloadTask
         self.configuration = configuration
         self.delegate = delegate
         session = URLSession(
-            configuration: downloadTask.taskConfigure.urlSessionConfigure(),
+            configuration: downloadTask.urlSessionConfigure,
             delegate: nil,
             delegateQueue: nil
         )
+        taskInfo = TaskInfo(src: downloadTask.url.absoluteURL.absoluteString, dest: downloadTask.destinationURL.absoluteURL.absoluteString, identifier: downloadTask.identifier)
+        tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HTTPChunkDownloadManager")
+            .appendingPathComponent("\(taskInfo.identifier).downloading")
+        taskInfoSavePath = tempDirectory.appendingPathComponent("info.json")
+        if FileManager.default.fileExists(atPath: taskInfoSavePath.path) {
+            do {
+                taskInfo = try JSONDecoder().decode(TaskInfo.self, from: Data(contentsOf: taskInfoSavePath))
+            } catch {
+                LoggerProxy.WLog(tag: kLogTag, msg: "恢复任务信息失败")
+            }
+        }
         LoggerProxy.DLog(tag: kLogTag, msg: "init:\(self)")
     }
 
@@ -91,100 +115,103 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
     // MARK: - 公共接口
 
     public func start() {
-        LoggerProxy.ILog(tag: kLogTag, msg: "开始下载,\(state)")
-        /// 这个需要启动task进行开始
-        if state == .initialed {
-            update(state: .preparing)
-            let startTask = Task {
-                await checkServerSupport()
+        Task {
+            LoggerProxy.ILog(tag: kLogTag, msg: "开始下载,\(state)")
+            /// 这个需要启动task进行开始
+            if state == .initialed {
+                await update(state: .preparing)
+                let startTask = Task {
+                    await checkServerSupport()
+                }
+                activeTasks["start"] = startTask
             }
-            activeTasks["start"] = startTask
         }
     }
 
     /// 暂停下载
     public func pause() {
-        LoggerProxy.ILog(tag: kLogTag, msg: "暂停下载,\(state)")
-        /// 下载中才能暂停
-        if state.canPause {
-            update(state: .paused)
+        Task {
+            LoggerProxy.ILog(tag: kLogTag, msg: "暂停下载,\(state)")
+            /// 下载中才能暂停
+            if state.canPause {
+                await update(state: .paused)
+            }
         }
     }
 
     /// 恢复继续下载
     public func resume() {
-        LoggerProxy.ILog(tag: kLogTag, msg: "恢复下载:\(chunkAvailable),\(state),\(activeTasks.keys()),\(downloadTask.identifier)")
-        if chunkAvailable {
-            /// 暂停才能继续
-            guard state.canResume else { return }
-            LoggerProxy.ILog(tag: kLogTag, msg: "恢复chunk文件下载")
-            update(state: .downloading)
-            Task{
+        Task {
+            LoggerProxy.ILog(tag: kLogTag, msg: "恢复下载:\(chunkAvailable),\(state),\(activeTasks.keys()),\(downloadTask.identifier)")
+            if chunkAvailable {
+                /// 暂停才能继续
+                guard state.canResume else { return }
+                LoggerProxy.ILog(tag: kLogTag, msg: "恢复chunk文件下载")
+                await update(state: .downloading)
                 await checkAndStartAvailableChunksDownload()
+            } else if state == .paused,
+                      activeTasks.keys().contains(where: { $0 == downloadTask.identifier }) {
+                LoggerProxy.ILog(tag: kLogTag, msg: "恢复普通文件下载")
+                await update(state: .downloading)
             }
-        } else if state == .paused,
-                  activeTasks.keys().contains(where: { $0 == downloadTask.identifier }) {
-            LoggerProxy.ILog(tag: kLogTag, msg: "恢复普通文件下载")
-            update(state: .downloading)
         }
     }
 
     /// 取消任务，只有完成/取消了，管理器才会停止，否则管理器会泄漏
     public func cancel() {
-        LoggerProxy.ILog(tag: kLogTag, msg: "取消下载,\(state)")
-        update(state: .cancelled)
-        cancelAllDownloadTasks()
+        Task {
+            LoggerProxy.ILog(tag: kLogTag, msg: "取消下载,\(state)")
+            if !state.isFinished {
+                await update(state: .cancelled)
+            }
+            cancelAllDownloadTasks()
+        }
     }
 
     /// 取消的任务不会删除临时目录，需要手动删除
     public func cleanup() {
-        if let tempDir = tempDirectory {
-            do {
-                try FileManager.default.removeItem(at: tempDir)
-                tempDirectory = nil
-            } catch {
-                LoggerProxy.DLog(tag: kLogTag, msg: "Error cleaning up temporary directory: \(error.localizedDescription)")
+        do {
+            if FileManager.default.fileExists(atPath: tempDirectory.path) {
+                try FileManager.default.removeItem(at: tempDirectory)
             }
+        } catch {
+            LoggerProxy.DLog(tag: kLogTag, msg: "Error cleaning up temporary directory: \(error.localizedDescription)")
         }
+    }
+
+    private func saveTaskInfo() throws {
+        try JSONEncoder().encode(taskInfo).write(to: taskInfoSavePath)
     }
 
     /// 创建临时文件夹
     private func createTempDirectory() throws {
-        let taskSha256 = downloadTask.identifier
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DownloadManagerChunks")
-            .appendingPathComponent("\(taskSha256).downloading")
-        if !FileManager.default.fileExists(atPath: tempDir.path) {
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: tempDirectory.path) {
+            try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         }
-        try? JSONSerialization
-            .data(withJSONObject: ["src": downloadTask.url.absoluteString,
-                                   "dest": downloadTask.destinationURL.absoluteString,
-                                   "sha256": taskSha256]
-            ).write(to: tempDir.appendingPathComponent("info.json"))
-
-        tempDirectory = tempDir
-        LoggerProxy.DLog(tag: kLogTag, msg: "createTempDirectory:\(tempDir)")
+        /// 创建分块是否，已经知道长度，这时候可以保存info信息
+        taskInfo.totalBytes = totalBytes
+        try? saveTaskInfo()
+        LoggerProxy.DLog(tag: kLogTag, msg: "createTempDirectory:\(tempDirectory)")
     }
 
     /// 创建分块任务
-    private func createChunkTasks() {
-        guard let tempDir = tempDirectory, totalBytes > 0 else { return }
+    private func createChunkTasks() async {
+        guard totalBytes > 0 else { return }
 
         var offset: Int64 = 0
-        var tempChunkTasks: [ChunkTask] = []
+        var tempChunkTasks: [Chunk] = []
         var index = 0
         while offset < totalBytes {
             let chunkSize = min(configuration.chunkSize, totalBytes - offset)
             let end = offset + chunkSize - 1
-            let chunkTask = ChunkTask(
+            let chunkTask = Chunk(
                 identifier: "\(downloadTask.identifier)-\(index)[\(offset)~\(end)]",
                 index: index,
                 downloadTask: downloadTask,
                 start: offset,
                 end: end,
                 downloadedBytes: 0,
-                filePath: tempDir.appendingPathComponent("[\(index)]\(offset)-\(chunkSize).part"),
+                filePath: tempDirectory.appendingPathComponent("[\(index)]\(offset)-\(chunkSize).part"),
                 isCompleted: false
             )
             tempChunkTasks.append(chunkTask)
@@ -193,15 +220,16 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         }
 
         chunkTasks = tempChunkTasks
-        checkLocalChunksStatus()
+        await checkLocalChunksStatus()
     }
 
     /// 检查本地分块
-    private func checkLocalChunksStatus() {
+    private func checkLocalChunksStatus() async {
         var totalDownloaded: Int64 = 0
 
         for i in 0 ..< chunkTasks.count {
-            let chunkPath = chunkTasks[i].filePath.path
+            let chunkTask = chunkTasks[i]
+            let chunkPath = chunkTask.filePath.path
             if FileManager.default.fileExists(atPath: chunkPath) {
                 do {
                     let attributes = try FileManager.default.attributesOfItem(atPath: chunkPath)
@@ -209,11 +237,14 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
                     if fileSize == chunkTasks[i].totalChunkSize {
                         chunkTasks[i].isCompleted = true
                         chunkTasks[i].downloadedBytes = fileSize
+                        taskDownloadedBytes[chunkTask.identifier] = fileSize
                     } else if fileSize > 0 {
                         chunkTasks[i].downloadedBytes = fileSize
+                        taskDownloadedBytes[chunkTask.identifier] = fileSize
                     } else {
                         try? FileManager.default.removeItem(atPath: chunkPath)
                         chunkTasks[i].downloadedBytes = 0
+                        taskDownloadedBytes[chunkTask.identifier] = 0
                     }
                 } catch {
                     try? FileManager.default.removeItem(atPath: chunkPath)
@@ -224,32 +255,30 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         }
 
         if totalBytes > 0 {
-            update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: totalBytes))
+            await update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: totalBytes))
         } else {
-            update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: -1))
+            await update(progress: DownloadProgress(downloadedBytes: totalDownloaded, totalBytes: -1))
         }
     }
 
     /// 获取到完整大小，这时候更新一次进度
-    private func updateTotalBytes(_ bytes: Int64) {
+    private func updateTotalBytes(_ bytes: Int64) async {
         totalBytes = bytes
-        downloadTask.totalBytes = totalBytes
-        update(progress: DownloadProgress(downloadedBytes: 0, totalBytes: bytes))
+        await update(progress: DownloadProgress(downloadedBytes: 0, totalBytes: bytes))
     }
 
     /// 更新分块进度
-    private func updateDownloadProgress(for identifier: String, addedBytes: Int64) {
+    private func updateDownloadProgress(for identifier: String, addedBytes: Int64) async {
         if let currentBytes = taskDownloadedBytes[identifier] {
             taskDownloadedBytes[identifier] = currentBytes + addedBytes
         } else {
             taskDownloadedBytes[identifier] = addedBytes
         }
-        updateProgressIfNeeded()
+        await updateProgressIfNeeded()
     }
 
-    private func updateProgressIfNeeded() {
+    private func updateProgressIfNeeded() async {
         let totalDownloaded = taskDownloadedBytes.values.reduce(0, +)
-        downloadTask.downloadedBytes = totalDownloaded
 
         let now = Date()
         guard now.timeIntervalSince(lastProgressUpdate) >= configuration.progressUpdateInterval else { return }
@@ -257,7 +286,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
 
         guard totalBytes > 0 else { return }
 
-        update(progress: DownloadProgress(timestamp: now.timeIntervalSinceNow, downloadedBytes: totalDownloaded, totalBytes: totalBytes))
+        await update(progress: DownloadProgress(timestamp: now.timeIntervalSince1970, downloadedBytes: totalDownloaded, totalBytes: totalBytes))
     }
 
     private func updateChunkStatus(at index: Int, completed: Bool, downloadedBytes: Int64) {
@@ -266,13 +295,13 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         chunkTasks[index].downloadedBytes = downloadedBytes
     }
 
-    private func getNextAvailableChunks(maxCount: Int) -> [ChunkTask] {
+    private func getNextAvailableChunks(maxCount: Int) -> [Chunk] {
         let currentActiveCount = activeTaskIndices.count
         let availableSlots = maxCount - currentActiveCount
 
         guard availableSlots > 0 else { return [] }
 
-        var chunksToStart: [ChunkTask] = []
+        var chunksToStart: [Chunk] = []
         for chunk in chunkTasks {
             if !chunk.isCompleted && !activeTaskIndices.contains(chunk.identifier) {
                 chunksToStart.append(chunk)
@@ -296,29 +325,32 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
 
     // MARK: - 其他私有方法（简化后的版本）
 
-    private func buildRequest(method: String = "GET", headers: [String: String] = [:]) -> URLRequest {
-        var request = URLRequest(url: downloadTask.url)
-        request.httpMethod = method
+//    private func buildRequest(method: String = "GET", headers: [String: String] = [:])async throws -> URLRequest {
 
-        for (key, value) in downloadTask.taskConfigure.headers {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-        for (key, value) in headers {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-
-        if let timeoutInterval = downloadTask.taskConfigure.timeoutInterval {
-            request.timeoutInterval = timeoutInterval
-        }
-
-        return request
-    }
+//        var request = URLRequest(url: downloadTask.url)
+//        request.httpMethod = method
+//
+//        for (key, value) in downloadTask.taskConfigure.headers {
+//            request.setValue(value, forHTTPHeaderField: key)
+//        }
+//        for (key, value) in headers {
+//            request.setValue(value, forHTTPHeaderField: key)
+//        }
+//
+//        if let timeoutInterval = downloadTask.taskConfigure.timeoutInterval {
+//            request.timeoutInterval = timeoutInterval
+//        }
+//
+//        return request
+//    }
 
     // 优先使用head获取文件长度
     private func checkServerSupport() async {
         LoggerProxy.DLog(tag: kLogTag, msg: "\(Date()):checkServerSupport:\(downloadTask.identifier)")
         do {
-            let (_, response) = try await session.data(for: buildRequest(method: "HEAD"))
+            // TODO: 检查info文件
+
+            let (_, response) = try await session.data(for: downloadTask.buildRequest(method: "HEAD"))
             try Task.checkCancellation()
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: true)
         } catch is CancellationError {
@@ -332,7 +364,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
     // 使用get方式 获取文件长度
     private func checkServerSupportWithGet() async {
         do {
-            let (_, response) = try await session.data(for: buildRequest(headers: ["Range": "bytes=0-1"]))
+            let (_, response) = try await session.data(for: downloadTask.buildRequest(headers: ["Range": "bytes=0-1"]))
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: false)
         } catch {
             await handleServerSupportResponse(response: nil, error: error, isHeadRequest: false)
@@ -344,12 +376,12 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         LoggerProxy.DLog(tag: kLogTag, msg: "\(Date()):handleServerSupportResponse:\(downloadTask.identifier), resp=\(response),error=\(error)")
 
         if let error = error {
-            await handleDownloadFailure(error: ChunkDownloadError.networkError(error.localizedDescription))
+            await handleDownloadFailure(error: DownloadError.networkError(error.localizedDescription))
             return
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
-            await handleDownloadFailure(error: ChunkDownloadError.invalidResponse)
+            await handleDownloadFailure(error: DownloadError.invalidResponse)
             return
         }
 
@@ -363,7 +395,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
                hasContentLength,
                let contentLength = contentLength,
                let contentLengthValue = Int64(contentLength) {
-                updateTotalBytes(contentLengthValue) // 直接调用，不需要 await
+                await updateTotalBytes(contentLengthValue) // 直接调用，不需要 await
                 await prepareForChunkDownload()
             } else {
                 await checkServerSupportWithGet()
@@ -380,7 +412,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             }
 
             if supportsRanges && fileSizeFromRange > 0 {
-                updateTotalBytes(fileSizeFromRange) // 直接调用，不需要 await
+                await updateTotalBytes(fileSizeFromRange) // 直接调用，不需要 await
                 await prepareForChunkDownload()
             } else {
                 await startNormalDownload()
@@ -391,36 +423,40 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
     /// 准备分块下载
     private func prepareForChunkDownload() async {
         guard totalBytes > 0 else {
-            await handleDownloadFailure(error: ChunkDownloadError.serverNotSupported)
+            await handleDownloadFailure(error: DownloadError.serverNotSupported)
             return
         }
 
         do {
             chunkAvailable = true
             try createTempDirectory() // 直接调用，不需要 await
-            createChunkTasks() // 直接调用，不需要 await
-            update(state: .downloading) // 直接调用，不需要 await
+            await createChunkTasks() // 直接调用，不需要 await
+            await update(state: .downloading) // 直接调用，不需要 await
             await checkAndStartAvailableChunksDownload()
         } catch {
-            let chunkError: ChunkDownloadError
-            if let ce = error as? ChunkDownloadError {
+            let chunkError: DownloadError
+            if let ce = error as? DownloadError {
                 chunkError = ce
             } else {
-                chunkError = .unknown(error)
+                chunkError = DownloadError(code: -1, description: error.localizedDescription)
             }
             await handleDownloadFailure(error: chunkError)
         }
     }
 
     private func startNormalDownload() async {
-        update(state: .downloading) // 直接调用，不需要 await
-        let request = buildRequest()
-        let taskKey = downloadTask.identifier
-        let task = Task {
-            await self.downloadNormalAsync(request: request)
-            self.activeTasks[taskKey] = nil
+        await update(state: .downloading) // 直接调用，不需要 await
+        do {
+            let request = try await downloadTask.buildRequest()
+            let taskKey = downloadTask.identifier
+            let task = Task {
+                await self.downloadNormalAsync(request: request)
+                self.activeTasks[taskKey] = nil
+            }
+            activeTasks[taskKey] = task
+        } catch {
+            await handleDownloadFailure(error: error)
         }
-        activeTasks[taskKey] = task
     }
 
     private func checkAndStartAvailableChunksDownload() async {
@@ -439,37 +475,52 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             }
         } else {
             for chunk in chunksToStart {
-                downloadChunk(chunk)
+                await downloadChunk(chunk)
             }
+        }
+    }
+
+    private func waitForResumeOrCancel() async throws {
+        let subject = $state.filter({$0 != .paused}).eraseToAnyPublisher()
+        while state == .paused { // 直接调用，不需要 await
+            for await _ in subject.values {
+                break
+            }
+            LoggerProxy.ILog(tag: kLogTag, msg: "暂停中恢复:\(state)")
+            if state == .cancelled { // 直接调用，不需要 await
+                throw DownloadError.cancelled
+            }
+            try Task.checkCancellation()
         }
     }
 
     /// 普通下载，就是一次性下载全部
     private func downloadNormalAsync(request: URLRequest) async {
         LoggerProxy.DLog(tag: kLogTag, msg: "start downloadNormalAsync")
-        var taskFileHandle: FileHandle?
         let identifier = downloadTask.identifier
+        let tempFile = downloadTask.destinationURL.appendingPathExtension(".downloading")
         do {
             let (bytes, response) = try await session.bytes(for: request)
             try Task.checkCancellation()
 
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {
-                throw ChunkDownloadError.invalidResponse
+                throw DownloadError.invalidResponse
             }
 
             let contentLength = httpResponse.allHeaderFields["Content-Length"] as? String
             let expectedTotalBytes = contentLength.flatMap { Int64($0) } ?? -1
-            updateTotalBytes(expectedTotalBytes) // 直接调用，不需要 await
+            await updateTotalBytes(expectedTotalBytes) // 直接调用，不需要 await
 
             let destinationDirectory = downloadTask.destinationURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
             try? FileManager.default.removeItem(at: downloadTask.destinationURL)
             FileManager.default.createFile(atPath: downloadTask.destinationURL.path, contents: nil)
 
-            let fileHandle = try FileHandle(forWritingTo: downloadTask.destinationURL)
-            taskFileHandle = fileHandle
-
+            let fileHandle = try FileHandle(forWritingTo: tempFile)
+            defer {
+                try? fileHandle.close()
+            }
             var totalDownloaded: Int64 = 0
             var buffer = Data()
 
@@ -477,81 +528,63 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
                 try Task.checkCancellation()
 
                 if state == .cancelled {
-                    throw ChunkDownloadError.cancelled
+                    throw DownloadError.cancelled
                 }
 
                 buffer.append(byte)
 
                 if buffer.count >= configuration.bufferSize {
-                    try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                    try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
                     totalDownloaded += Int64(buffer.count)
                     buffer.removeAll(keepingCapacity: true)
                 }
 
                 if state == .paused {
-                    let cancelSubject = PassthroughSubject<Void, Never>()
-                    var events = [AnyCancellable]()
-                    let subject = downloadTask.stateSubject.filter({
-                        $0 != .paused
-                    }).map({ _ in () }).merge(with: cancelSubject)
-                    while state == .paused { // 直接调用，不需要 await
-                        if !buffer.isEmpty {
-                            try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-                            totalDownloaded += Int64(buffer.count)
-                            buffer.removeAll(keepingCapacity: true)
-                        }
-
-                        await withTaskCancellationHandler {
-                            for await _ in subject.values {
-                                LoggerProxy.ILog(tag: kLogTag, msg: "暂停中恢复……")
-                                break
-                            }
-                        } onCancel: {
-                            cancelSubject.send(())
-                        }
-                        LoggerProxy.ILog(tag: kLogTag, msg: "暂停中恢复:\(state)")
-                        if state == .cancelled { // 直接调用，不需要 await
-                            throw ChunkDownloadError.cancelled
-                        }
-                        try Task.checkCancellation()
+                    if !buffer.isEmpty {
+                        try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                        totalDownloaded += Int64(buffer.count)
+                        buffer.removeAll(keepingCapacity: true)
                     }
+                    try await waitForResumeOrCancel()
                 }
             }
 
             if !buffer.isEmpty {
-                try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
                 totalDownloaded += Int64(buffer.count)
                 buffer.removeAll()
             }
 
             LoggerProxy.DLog(tag: kLogTag, msg: "close file handler for normal download")
-            try? fileHandle.close()
 
             if expectedTotalBytes > 0, /// 已经有文件长度的前提
                totalDownloaded != expectedTotalBytes {
-                throw ChunkDownloadError.corruptedChunk(identifier)
+                throw DownloadError.corruptedChunk(identifier)
             }
-
+            // 下载完成才重命名回去
+            try FileManager.default.moveItem(at: tempFile, to: downloadTask.destinationURL)
             await handleDownloadCompletion()
         } catch {
-            try? taskFileHandle?.close()
+            if FileManager.default.fileExists(atPath: tempFile.path) {
+                try? FileManager.default.removeItem(at: tempFile)
+            }
             await handleNormalDownloadError(error)
         }
     }
 
-    private func writeBufferToFile(buffer: Data, fileHandle: FileHandle, identifier: String) throws {
+    private func writeBufferToFile(buffer: Data, fileHandle: FileHandle, identifier: String) async throws {
         let deltaSize = Int64(buffer.count)
         try fileHandle.write(contentsOf: buffer)
-        updateDownloadProgress(for: identifier, addedBytes: deltaSize)
-        LoggerProxy.DLog(tag: kLogTag, msg: "write to file handler for download with:[\(deltaSize)] \(identifier)")
+        await updateDownloadProgress(for: identifier, addedBytes: deltaSize)
+        LoggerProxy.VLog(tag: kLogTag, msg: "write to file handler for download with:[\(deltaSize)] \(identifier)")
     }
 
     private func handleNormalDownloadError(_ error: Error) async {
-        let chunkError: ChunkDownloadError
-        if let ce = error as? ChunkDownloadError {
+        let chunkError: DownloadError
+        if let ce = error as? DownloadError {
             chunkError = ce
         } else {
-            chunkError = .unknown(error)
+            chunkError = DownloadError.from(error)
         }
 
         if case .cancelled = chunkError {
@@ -561,7 +594,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         }
     }
 
-    private func openFileHandler(for chunkTask: ChunkTask) throws -> FileHandle {
+    private func openFileHandler(for chunkTask: Chunk) throws -> FileHandle {
         let fileHandle: FileHandle
         if chunkTask.downloadedBytes > 0 {
             fileHandle = try FileHandle(forWritingTo: chunkTask.filePath)
@@ -573,33 +606,32 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
         return fileHandle
     }
 
-    private func downloadChunk(_ chunkTask: ChunkTask) {
+    private func downloadChunk(_ chunkTask: Chunk) async {
         LoggerProxy.DLog(tag: kLogTag, msg: "downloadChunk:\(chunkTask.identifier)")
+        do {
+            let startByte = chunkTask.start + chunkTask.downloadedBytes
+            let endByte = chunkTask.end
+            let request = try await downloadTask.buildRequest(headers: ["Range": "bytes=\(startByte)-\(endByte)"])
 
-        var request = URLRequest(url: downloadTask.url)
-        let startByte = chunkTask.start + chunkTask.downloadedBytes
-        let endByte = chunkTask.end
-        request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
-
-        for (key, value) in downloadTask.taskConfigure.headers {
-            request.setValue(value, forHTTPHeaderField: key)
+            let taskKey = chunkTask.identifier
+            let task = Task {
+                await self.downloadChunkAsync(request: request, chunk: chunkTask)
+                self.activeTasks[taskKey] = nil
+            }
+            activeTasks[taskKey] = task
+        } catch {
+            await handleChunkError(error, for: chunkTask)
         }
-
-        let taskKey = chunkTask.identifier
-        let task = Task {
-            await self.downloadChunkAsync(request: request, chunk: chunkTask)
-            self.activeTasks[taskKey] = nil
-        }
-        activeTasks[taskKey] = task
     }
 
-    private func downloadChunkAsync(request: URLRequest, chunk: ChunkTask) async {
+//    @concurrent
+    private func downloadChunkAsync(request: URLRequest, chunk: Chunk) async {
         LoggerProxy.DLog(tag: kLogTag, msg: "start downloadChunkAsync--->:\(chunk.identifier)")
-        var taskFileHandle: FileHandle?
+//        var taskFileHandle: FileHandle?
         var downloadedBytes: Int64 = chunk.downloadedBytes
         let identifier = chunk.identifier
         do {
-            if state == .cancelled {
+            if await state == .cancelled {
                 return
             }
             let (bytes, response) = try await session.bytes(for: request)
@@ -607,73 +639,51 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
 
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 206 || httpResponse.statusCode == 200 else {
-                throw ChunkDownloadError.invalidResponse
+                throw DownloadError.invalidResponse
             }
 
-            let fileHandle = try openFileHandler(for: chunk)
+            let fileHandle = try await openFileHandler(for: chunk)
             defer {
                 try? fileHandle.close()
             }
-            taskFileHandle = fileHandle
 
             // 初始化任务下载字节数
-            updateDownloadProgress(for: identifier, addedBytes: chunk.downloadedBytes) // 直接调用，不需要 await
+            await updateDownloadProgress(for: identifier, addedBytes: chunk.downloadedBytes) // 直接调用，不需要 await
 
             var buffer = Data()
             for try await byte in bytes {
                 try Task.checkCancellation()
 
-                if state == .cancelled {
-                    throw ChunkDownloadError.cancelled
+                if await state == .cancelled {
+                    throw DownloadError.cancelled
                 }
                 /// 其他下载失败
-                if state.isFailed {
+                if await state.isFailed {
                     // 直接不玩了……
                     LoggerProxy.DLog(tag: kLogTag, msg: "有其他chunk下载失败，直接取消下载任务")
                     return
                 }
 
                 buffer.append(byte)
-                if buffer.count >= 8 * 1024 {
-                    try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                if await state == .paused {
+                    if !buffer.isEmpty {
+                        try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                        downloadedBytes += Int64(buffer.count)
+                        buffer.removeAll(keepingCapacity: true)
+                    }
+
+                    try await waitForResumeOrCancel()
+                }
+                if buffer.count >= configuration.bufferSize { // 64k 一次保存
+                    try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
                     downloadedBytes += Int64(buffer.count)
                     buffer.removeAll(keepingCapacity: true)
-                }
-
-                if state == .paused {
-                    let cancelSubject = PassthroughSubject<Void, Never>()
-                    var events = [AnyCancellable]()
-                    let subject = downloadTask.stateSubject.filter({
-                        $0 != .paused
-                    }).map({ _ in () }).merge(with: cancelSubject)
-
-                    // 处理暂停状态
-                    while state == .paused { // 直接调用，不需要 await
-                        if !buffer.isEmpty {
-                            try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-                            downloadedBytes += Int64(buffer.count)
-                            buffer.removeAll(keepingCapacity: true)
-                        }
-
-                        await withTaskCancellationHandler {
-                            for await _ in subject.values {
-                                break
-                            }
-                        } onCancel: {
-                            cancelSubject.send(())
-                        }
-
-                        if state == .cancelled { // 直接调用，不需要 await
-                            throw ChunkDownloadError.cancelled
-                        }
-                        try Task.checkCancellation()
-                    }
                 }
             }
 
             // 写入剩余缓冲区数据
             if !buffer.isEmpty {
-                try writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
+                try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
                 downloadedBytes += Int64(buffer.count)
                 buffer.removeAll()
             }
@@ -682,21 +692,20 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             let expectedBytes = chunk.totalChunkSize
             if downloadedBytes != expectedBytes {
                 LoggerProxy.DLog(tag: kLogTag, msg: "验证下载结果失败:\(downloadedBytes)!=\(expectedBytes) , \(request.allHTTPHeaderFields),response=>\(response)")
-                throw ChunkDownloadError.corruptedChunk(chunk.identifier)
+                throw DownloadError.corruptedChunk(chunk.identifier)
             }
 
             LoggerProxy.DLog(tag: kLogTag, msg: "close file handler:\(identifier)")
 
             // 更新分片状态并处理完成
-//            private func updateChunkStatus(at index: Int, completed: Bool, downloadedBytes: Int64) {
-            updateChunkStatus(at: chunk.index, completed: true, downloadedBytes: downloadedBytes) // 直接调用，不需要 await
+            await updateChunkStatus(at: chunk.index, completed: true, downloadedBytes: downloadedBytes) // 直接调用，不需要 await
             await onChunkComplete(for: chunk)
         } catch {
             await handleChunkError(error, for: chunk)
         }
     }
 
-    private func onChunkComplete(for chunk: ChunkTask) async {
+    private func onChunkComplete(for chunk: Chunk) async {
         let allCompleted = markChunkComplete(for: chunk.identifier) // 直接调用，不需要 await
 
         let state = self.state
@@ -715,29 +724,27 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             cleanup() // 直接调用，不需要 await
             await handleDownloadCompletion()
         } catch {
-            let chunkError: ChunkDownloadError
-            if let ce = error as? ChunkDownloadError {
+            let chunkError: DownloadError
+            if let ce = error as? DownloadError {
                 chunkError = ce
             } else {
-                chunkError = .unknown(error)
+                chunkError = DownloadError.from(error)
             }
             await handleDownloadFailure(error: chunkError)
         }
     }
 
     private func mergeChunksToFile() async throws {
-        update(state: .merging) // 直接调用，不需要 await
+        await update(state: .merging) // 直接调用，不需要 await
 
-        guard let tempMergeFile = tempDirectory?.appendingPathComponent("final_merged_file.tmp") else {
-            throw ChunkDownloadError.fileSystemError("无法确定合并文件的临时路径")
-        }
+        let tempMergeFile = tempDirectory.appendingPathComponent("final_merged_file.tmp")
         /// 删除
         if FileManager.default.fileExists(atPath: tempMergeFile.path) {
             try FileManager.default.removeItem(at: tempMergeFile)
         }
         let dir = downloadTask.destinationURL.deletingLastPathComponent()
-            
-        if !FileManager.default.fileExists(atPath: downloadTask.destinationURL.deletingLastPathComponent().path){
+
+        if !FileManager.default.fileExists(atPath: downloadTask.destinationURL.deletingLastPathComponent().path) {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         try checkDiskSpace(requiredSpace: totalBytes, destinationURL: dir)
@@ -758,7 +765,7 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             defer { try? chunkHandle.close() }
 
             // 使用 128k 块，进行文件合并
-            let bufferSize = 128 * 1024
+            let bufferSize = Int(min(max(configuration.chunkSize, 128 * 1024), 1 * 1024 * 1024)) // 128k ~ 1m
             while let data = try chunkHandle.read(upToCount: bufferSize) {
                 try fileHandle.write(contentsOf: data)
             }
@@ -776,24 +783,24 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
 
     private func checkDiskSpace(requiredSpace: Int64, destinationURL: URL) throws {
         if DiskSpaceManager.shared.getAvailableDiskSpace(for: destinationURL.path) < requiredSpace {
-            throw ChunkDownloadError.insufficientDiskSpace
+            throw DownloadError.insufficientDiskSpace
         }
     }
 
-    private func validateChunk(_ chunk: ChunkTask) throws {
+    private func validateChunk(_ chunk: Chunk) throws {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: chunk.filePath.path) else {
-            throw ChunkDownloadError.corruptedChunk(chunk.identifier)
+            throw DownloadError.corruptedChunk(chunk.identifier)
         }
 
         do {
             let attributes = try fileManager.attributesOfItem(atPath: chunk.filePath.path)
             let fileSize = attributes[.size] as? Int64 ?? 0
             if fileSize != chunk.totalChunkSize {
-                throw ChunkDownloadError.corruptedChunk(chunk.identifier)
+                throw DownloadError.corruptedChunk(chunk.identifier)
             }
         } catch {
-            throw ChunkDownloadError.corruptedChunk(chunk.identifier)
+            throw DownloadError.corruptedChunk(chunk.identifier)
         }
     }
 
@@ -805,11 +812,11 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             fullSize = taskDownloadedBytes.values.reduce(0, +)
         }
 
-        update(progress: DownloadProgress(downloadedBytes: fullSize, totalBytes: fullSize))
-        update(state: .completed) // 直接调用，不需要 await
+        await update(progress: DownloadProgress(downloadedBytes: fullSize, totalBytes: fullSize))
+        await update(state: .completed) // 直接调用，不需要 await
     }
 
-    private func handleDownloadFailure(error: ChunkDownloadError) async {
+    private func handleDownloadFailure(error: any Error) async {
         LoggerProxy.ELog(tag: kLogTag, msg: "handleDownloadFailure:\(error)")
         let currentState = state // 直接调用，不需要 await
         /// 已经报告了失败，不重复报
@@ -817,19 +824,19 @@ public actor ChunkDownloadManager: ChunkDownloadManagerProtocol { /// nonisolate
             return
         }
         if currentState != .completed && currentState != .cancelled {
-            update(state: .failed(.chunkDownloadError(error))) // 直接调用，不需要 await
+            await update(state: .failed(DownloadError.from(error))) // 直接调用，不需要 await
         }
         /// 异常了，取消所有其他下载
         cancelAllDownloadTasks()
     }
 
-    private func handleChunkError(_ error: Error, for chunk: ChunkTask, funcName: StaticString = #function, line: Int = #line) async {
+    private func handleChunkError(_ error: Error, for chunk: Chunk, funcName: StaticString = #function, line: Int = #line) async {
         LoggerProxy.ELog(tag: kLogTag, msg: "handler chunk error:\(error)", funcName: funcName, line: line)
-        let chunkError: ChunkDownloadError
-        if let ce = error as? ChunkDownloadError {
+        let chunkError: DownloadError
+        if let ce = error as? DownloadError {
             chunkError = ce
         } else {
-            chunkError = .unknown(error)
+            chunkError = DownloadError.from(error)
         }
 
         if case .cancelled = chunkError {

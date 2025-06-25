@@ -23,42 +23,42 @@ extension DownloadTask {
 
 // MARK: - MockChunkDownloadManager
 
-actor MockChunkDownloadManager: ChunkDownloadManagerProtocol {
-    class DelegateProxy: ChunkDownloadManagerDelegate, @unchecked Sendable {
-        weak var delegate: ChunkDownloadManagerDelegate?
-        weak var mgr: ChunkDownloadManagerProtocol?
+actor MockChunkDownloadManager: HTTPChunkDownloadManagerProtocol {
+    class DelegateProxy: HTTPChunkDownloadManagerDelegate, @unchecked Sendable {
+        weak var delegate: HTTPChunkDownloadManagerDelegate?
+        weak var mgr: HTTPChunkDownloadManagerProtocol?
 
-        func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
+        func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
             if let delegate = delegate, let mgr = mgr {
-                delegate.chunkDownloadManager(mgr, didCompleteWith: task)
+                delegate.HTTPChunkDownloadManager(mgr, didCompleteWith: task)
             }
         }
 
-        nonisolated func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
+        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
             if let delegate = delegate, let mgr = mgr {
-                delegate.chunkDownloadManager(mgr, task: task, didUpdateProgress: progress)
+                delegate.HTTPChunkDownloadManager(mgr, task: task, didUpdateProgress: progress)
             }
         }
 
-        nonisolated func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
+        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
             if let delegate = delegate, let mgr = mgr {
-                delegate.chunkDownloadManager(mgr, task: task, didUpdateState: state)
+                delegate.HTTPChunkDownloadManager(mgr, task: task, didUpdateState: state)
             }
         }
 
-        nonisolated func chunkDownloadManager(_ manager: any ChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
+        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
             if let delegate = delegate, let mgr = mgr {
-                delegate.chunkDownloadManager(mgr, task: task, didFailWithError: error)
+                delegate.HTTPChunkDownloadManager(mgr, task: task, didFailWithError: error)
             }
         }
     }
 
     var chunkAvailable: Bool
     var downloadTask: DownloadTask
-    var configuration: ChunkConfiguration
-    let mgr: ChunkDownloadManager
+    var configuration: HTTPChunkDownloadConfiguration
+    let mgr: HTTPChunkDownloadManager
     let proxy: DelegateProxy
-    weak var delegate: ChunkDownloadManagerDelegate?
+    weak var delegate: HTTPChunkDownloadManagerDelegate?
 
     var startCallCount = 0
     var pauseCallCount = 0
@@ -73,14 +73,14 @@ actor MockChunkDownloadManager: ChunkDownloadManagerProtocol {
         }
     }
 
-    init(downloadTask: DownloadTask, configuration: ChunkConfiguration, delegate: ChunkDownloadManagerDelegate?) {
+    init(downloadTask: DownloadTask, configuration: HTTPChunkDownloadConfiguration, delegate: HTTPChunkDownloadManagerDelegate?) {
         self.downloadTask = downloadTask
         self.configuration = configuration
         self.delegate = delegate
         chunkAvailable = false
         let proxy = DelegateProxy()
         self.proxy = proxy
-        mgr = ChunkDownloadManager(downloadTask: downloadTask, configuration: configuration, delegate: proxy)
+        mgr = HTTPChunkDownloadManager(downloadTask: downloadTask, configuration: configuration, delegate: proxy)
 
         proxy.delegate = delegate
         proxy.mgr = self
@@ -118,22 +118,22 @@ actor MockChunkDownloadManager: ChunkDownloadManagerProtocol {
     func simulateProgress(downloaded: Int64, total: Int64) async {
         downloadTask.setDownloadedBytes(downloaded)
         downloadTask.setTotalBytes(total)
-        delegate?.chunkDownloadManager(self, task: downloadTask, didUpdateProgress: DownloadProgress(downloadedBytes: downloaded, totalBytes: total))
+        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateProgress: DownloadProgress(downloadedBytes: downloaded, totalBytes: total))
     }
 
     func simulateStateChange(_ state: DownloadState) async {
         _state = state
         downloadTask.setState(state)
-        delegate?.chunkDownloadManager(self, task: downloadTask, didUpdateState: state)
+        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateState: state)
         if state.isFinished {
-            delegate?.chunkDownloadManager(self, didCompleteWith: downloadTask)
+            delegate?.HTTPChunkDownloadManager(self, didCompleteWith: downloadTask)
         }
     }
 
     func simulateFailure(_ error: Error) async {
         _state = .failed(DownloadError.from(error))
         downloadTask.setState(.failed(DownloadError.from(error)))
-        delegate?.chunkDownloadManager(self, task: downloadTask, didFailWithError: error)
+        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didFailWithError: error)
     }
 }
 

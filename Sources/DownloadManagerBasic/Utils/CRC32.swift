@@ -8,9 +8,9 @@
 import CryptoKit // 重新引入 CryptoKit，用于 sha256() 实现
 import Foundation
 
-struct CRC32 {
+public struct CRC32 {
     // CRC32 查找表
-    private static var crc32Table: [UInt32] = {
+    private static let crc32Table: [UInt32] = {
         var table = [UInt32](repeating: 0, count: 256)
         for i in 0 ..< 256 {
             var crc: UInt32 = UInt32(i)

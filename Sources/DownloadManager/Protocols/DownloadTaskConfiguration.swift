@@ -7,6 +7,7 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
 
     /// session配置下载请求超时时间
     public var timeoutIntervalForRequest: TimeInterval?
+
     /// session配置下载超时时间
     public var timeoutIntervalForResource: TimeInterval?
 
@@ -19,7 +20,7 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
     public var chunkSize: Int64 = 4 * 1024 * 1024
 
     /// 最大并发分片数
-    public var maxConcurrentChunks: Int = .max
+    public var maxConcurrentChunks: Int = 4
 
     /// 下载优先级（0-100）
     public var priority: Int = 100
@@ -78,7 +79,7 @@ public struct DownloadTaskConfiguration: Codable, Equatable, Hashable, Sendable 
     /// 文件完整性校验类型
     public var integrityCheck: IntegrityCheckType?
 
-    func urlSessionConfigure() -> URLSessionConfiguration {
+    public func urlSessionConfigure() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.default
 
         // 设置请求头
