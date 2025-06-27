@@ -82,17 +82,17 @@ let package = Package(
                 .product(name: "Atomics",package: "swift-atomics"),
             ],
             path: "UI",
-            resources: [
-                .process("Resources")
-            ]
+//            resources: [
+//                .process("Resources")
+//            ]
         ),
         /// 单元测试
         .testTarget(
             name: "DownloadManagerTests",
             dependencies: ["DownloadManager"],
-            resources: [
-                .process("Resources")
-            ]
+//            resources: [
+//                .process("Resources")
+//            ]
         ),
     ]
 )

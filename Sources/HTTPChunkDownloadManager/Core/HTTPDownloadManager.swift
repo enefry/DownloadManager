@@ -268,13 +268,18 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     }
 
     /// 更新分块进度
-    private func updateDownloadProgress(for identifier: String, addedBytes: Int64) async {
+    private func updateDownloadProgress(for identifier: String, addedBytes: Int64) async -> (Int64, Int64) {
+        let result: (Int64, Int64)
         if let currentBytes = taskDownloadedBytes[identifier] {
-            taskDownloadedBytes[identifier] = currentBytes + addedBytes
+            let newBytes = currentBytes + addedBytes
+            taskDownloadedBytes[identifier] = newBytes
+            result = (currentBytes, newBytes)
         } else {
             taskDownloadedBytes[identifier] = addedBytes
+            result = (0, addedBytes)
         }
         await updateProgressIfNeeded()
+        return result
     }
 
     private func updateProgressIfNeeded() async {
@@ -481,7 +486,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     }
 
     private func waitForResumeOrCancel() async throws {
-        let subject = $state.filter({$0 != .paused}).eraseToAnyPublisher()
+        let subject = $state.filter({ $0 != .paused }).eraseToAnyPublisher()
         while state == .paused { // 直接调用，不需要 await
             for await _ in subject.values {
                 break
@@ -575,8 +580,8 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     private func writeBufferToFile(buffer: Data, fileHandle: FileHandle, identifier: String) async throws {
         let deltaSize = Int64(buffer.count)
         try fileHandle.write(contentsOf: buffer)
-        await updateDownloadProgress(for: identifier, addedBytes: deltaSize)
-        LoggerProxy.VLog(tag: kLogTag, msg: "write to file handler for download with:[\(deltaSize)] \(identifier)")
+        let progress = await updateDownloadProgress(for: identifier, addedBytes: deltaSize)
+        LoggerProxy.VLog(tag: kLogTag, msg: "write to file handler for download with: offset=\(progress.0) +  \(deltaSize)=\(progress.1) \(identifier)")
     }
 
     private func handleNormalDownloadError(_ error: Error) async {
@@ -648,7 +653,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             }
 
             // 初始化任务下载字节数
-            await updateDownloadProgress(for: identifier, addedBytes: chunk.downloadedBytes) // 直接调用，不需要 await
+//            await updateDownloadProgress(for: identifier, addedBytes: chunk.downloadedBytes) // 直接调用，不需要 await
 
             var buffer = Data()
             for try await byte in bytes {

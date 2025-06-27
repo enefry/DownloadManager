@@ -11,9 +11,16 @@ import SwiftUI
 
 @MainActor
 class DownloadManagerViewModel: ObservableObject {
+    struct Counts: Equatable, Hashable {
+        var all: Int = 0
+        var actives: Int = 0
+        var pause: Int = 0
+        var finished: Int = 0
+    }
+
     let manager: any DownloadManagerProtocol
-    @Published var tasks: [any DownloadTaskProtocol] = []
-    @Published var activeTaskCount: Int = 0
+    var tasks: [any DownloadTaskProtocol] = []
+    @Published var counter: Counts = Counts()
     @Published var selectedFilter: DownloadStateFilter = .all
 
     private var cancellables = Set<AnyCancellable>()
@@ -26,15 +33,27 @@ class DownloadManagerViewModel: ObservableObject {
     private func setupBindings() {
         if let concreteManager = manager as? DownloadManager {
             concreteManager.state.$allTasks
-                .map { $0 as [any DownloadTaskProtocol] }
-                .receive(on: DispatchQueue.main)
-                .assign(to: \.tasks, on: self)
+                .combineLatest(concreteManager.state.$activeTaskCount)
+                .throttle(for: 0.1, scheduler: RunLoop.main, latest: true)
+                .sink(receiveValue: { [weak self] tasks, count in
+                    self?.update(tasks, activeCount: count)
+                })
                 .store(in: &cancellables)
+        }
+    }
 
-            concreteManager.state.$activeTaskCount
-                .receive(on: DispatchQueue.main)
-                .assign(to: \.activeTaskCount, on: self)
-                .store(in: &cancellables)
+    @MainActor
+    func update(_ tasks: [any DownloadTaskProtocol], activeCount: Int) {
+        let pause = tasks.reduce(0, { $0 + (($1.state == .paused) ? 1 : 0) })
+        let finished = tasks.reduce(0, { $0 + (($1.state.isFinished) ? 1 : 0) })
+        var existsTasks = Set(self.tasks.map({ $0.identifier }))
+        var newTasks = Set(tasks.map({ $0.identifier }))
+        if existsTasks != newTasks {
+            self.tasks = tasks
+        }
+        let newCount = Counts(all: tasks.count, actives: activeCount, pause: pause, finished: finished)
+        if newCount != counter {
+            counter = newCount
         }
     }
 
@@ -84,7 +103,7 @@ public struct DownloadManagerView: View {
 
     public var body: some View {
         #if DEBUG
-        let _ = Self._printChanges()
+//            let _ = Self._printChanges()
         #endif
         VStack(spacing: 0) {
             GlobalActionsView(viewModel: viewModel)
@@ -108,24 +127,110 @@ public struct DownloadManagerView: View {
     }
 }
 
+private enum ActionType {
+    case none, pause, resume, cancel, remove, removeFinish
+}
+
+private struct ActionBlock {
+    var show: Bool = false
+    var type: ActionType = .none
+    var title: String = ""
+    var destructive: Bool = false
+    var message: String = ""
+    var action: @MainActor () -> Void = {}
+}
+
 // MARK: - Subviews
 
 private struct GlobalActionsView: View {
     @ObservedObject var viewModel: DownloadManagerViewModel
+    @State var action = ActionBlock()
 
     var body: some View {
         HStack {
-            Text("下载中: \(viewModel.activeTaskCount)")
+            Text("下载中: \(viewModel.counter.actives)")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
             Spacer()
-            Button("全部暂停", action: viewModel.pauseAll)
-            Button("全部恢复", action: viewModel.resumeAll)
-            Button("清除已完成", action: viewModel.removeAllFinished)
-                .foregroundColor(.red)
-            Button("删除所有", action: viewModel.removeAll)
+            HStack {
+                Button(action: {
+                    action = ActionBlock(show: true, type: .pause, title: "暂停所有", message: "暂停所有任务？", action: viewModel.pauseAll)
+                }, label: {
+                    Image(systemName: "pause.circle")
+                        .font(.system(size: 32))
+                        .frame(width: 40, height: 40)
+                })
+                .disabled(viewModel.counter.actives == 0)
+
+                Button(action: {
+                    action = ActionBlock(show: true, type: .resume, title: "恢复所有", message: "恢复所有下载？", action: viewModel.resumeAll)
+                }, label: {
+                    Image(systemName: "play.circle")
+                        .font(.system(size: 32))
+                        .frame(width: 40, height: 40)
+                })
+                .disabled(viewModel.counter.pause == 0)
+
+                Button(action: {
+                    action = ActionBlock(show: true, type: .cancel, title: "停止所有", message: "停止所有下载？", action: viewModel.manager.cancelAll)
+                }, label: {
+                    Image(systemName: "stop.circle")
+                        .font(.system(size: 32))
+                        .frame(width: 40, height: 40)
+                })
+                .disabled(viewModel.counter.actives == 0)
+
+                Button(action: {
+                    action = ActionBlock(show: true, type: .cancel, title: "移除完成", destructive: true, message: "移除所有已经完成的任务？", action: viewModel.manager.removeAllFinished)
+                }, label: {
+                    Image(systemName: "clear.fill")
+                        .font(.system(size: 32))
+                        .frame(width: 40, height: 40)
+                        .foregroundColor(.red)
+                })
+                .disabled(viewModel.counter.finished == 0)
+
+                Button(action: {
+                    action = ActionBlock(show: true, type: .remove, title: "删除所有", message: "删除所有下载任务（包括未完成的的临时文件）？", action: viewModel.removeAll)
+                }, label: {
+                    Image(systemName: "trash.circle.fill")
+                        .font(.system(size: 32))
+                        .frame(width: 40, height: 40)
+                        .foregroundColor(.red)
+                })
+                .disabled(viewModel.counter.all == 0)
+            }.opacity(viewModel.counter.all > 0 ? 1 : 0)
         }
-        .padding()
+        .alert(action.title, isPresented: $action.show, actions: {
+            Button(
+                role: .cancel,
+                action: {
+                    withAnimation {
+                        action.show = false
+                    }
+                }
+            ) {
+                Text("取消")
+            }
+            Button(
+                role: action.destructive ? .destructive : nil,
+                action: {
+                    withAnimation {
+                        action.show = true
+                        action.action()
+                    }
+                }
+            ) {
+                Text("确定")
+            }
+
+        }, message: {
+            VStack {
+                Text(action.message)
+                    .font(.body)
+                    .padding()
+            }
+        })
     }
 }
 
@@ -156,7 +261,7 @@ private struct TaskRowView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self._printChanges()
+//            _ = Self._printChanges()
         #endif
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -239,7 +344,7 @@ class DownloadTaskViewModel: ObservableObject {
             if let concreteTask = task as? DownloadTask {
                 concreteTask.speedPublisher
                     .receive(on: DispatchQueue.main)
-                    .map({"\(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file))/s"})
+                    .map({ "\(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file))/s" })
                     .assign(to: \.speedText, on: self)
                     .store(in: &cancellables)
             }
@@ -366,3 +471,139 @@ extension DownloadStateFilter {
         return allCases
     }
 }
+
+// struct ActionConfirmView: View {
+//    @Binding var isPresented: Bool
+//    let title: String
+//    let message: String
+//    let comfirmTitle: String
+//    let cancelTitle: String
+//    let action: () -> Void
+//
+//    var body: some View {
+//        VStack(spacing: 0) {
+//            // 标题栏
+//            HStack {
+//                Button(cancelTitle) {
+//                    isPresented.toggle()
+//                }
+//                .foregroundColor(.secondary)
+//                .font(.body)
+//
+//                Spacer()
+//
+//                Text(title)
+//                    .font(.headline)
+//                    .fontWeight(.semibold)
+//                    .foregroundColor(.primary)
+//
+//                Spacer()
+//
+//                Button(comfirmTitle) {
+//                    isPresented.toggle()
+//                    action()
+//                }
+//                .foregroundColor(validationResult.isInvalid() ? .secondary : .accentColor)
+//                .font(.body)
+//                .fontWeight(.medium)
+//                .disabled(validationResult.isInvalid())
+//            }
+//            .padding(.horizontal, 20)
+//            .padding(.vertical, 16)
+//            .background(Color.systemBackground)
+//
+//            Divider()
+//
+//            // 输入区域
+//            VStack(alignment: .leading, spacing: 12) {
+//                TextField(placeholder, text: $fileName)
+//                    .textFieldStyle(RoundedBorderTextFieldStyle())
+//                    .focused($isTextFieldFocused)
+//                    .onSubmit {
+//                        if !validationResult.isInvalid() {
+//                            action(fileName.trimmingCharacters(in: .whitespacesAndNewlines), true)
+//                        }
+//                    }
+//
+//                    .onChange(of: fileName) { _, newValue in
+//                        validateInput(newValue)
+//                    }
+//
+//                // 验证提示信息
+//                if case let .invalid(message) = validationResult {
+//                    HStack {
+//                        Image(systemName: "exclamationmark.triangle.fill")
+//                            .foregroundColor(.red)
+//                            .font(.caption)
+//                        Text(message)
+//                            .font(.caption)
+//                            .foregroundColor(.red)
+//                    }
+//                    .transition(.opacity.combined(with: .move(edge: .top)))
+//                } else if case let .warning(message) = validationResult {
+//                    HStack {
+//                        Image(systemName: "exclamationmark.triangle.fill")
+//                            .foregroundColor(.orange)
+//                            .font(.caption)
+//                        Text(message)
+//                            .font(.caption)
+//                            .foregroundColor(.orange)
+//                    }
+//                    .transition(.opacity.combined(with: .move(edge: .top)))
+//                }
+//            }
+//            .padding(.horizontal, 20)
+//            .padding(.vertical, 20)
+//            .background(Color.systemBackground)
+//        }
+//        .background(Color.systemBackground)
+//        .cornerRadius(14)
+//        .shadow(color: Color.black.opacity(0.1), radius: 10, x: 0, y: 4)
+//        .frame(maxWidth: 320)
+//        .onAppear {
+//            isTextFieldFocused = true
+//            validateInput(fileName)
+//        }
+//        .animation(.easeInOut(duration: 0.2), value: validationResult)
+//    }
+// }
+//
+//// 使用修饰符的版本
+// struct ActionComfirmDialog: ViewModifier {
+//    @Binding var isPresented: Bool
+//    let title: String
+//    let message: String
+//    let comfirmTitle: String
+//    let cancelTitle: String
+//    let action: () -> Void
+//
+//    func body(content: Content) -> some View {
+//        content
+//            .overlay(
+//                ZStack {
+//                    if isPresented {
+//                        Color.black.opacity(0.3)
+//                            .ignoresSafeArea()
+//                            .onTapGesture {
+//                                isPresented = false
+//                                action()
+//                            }
+//
+//                        FileNameInputView(
+//                            title: title,
+//                            fileName: fileName,
+//                            placeholder: placeholder,
+//                            saveTitle: saveTitle,
+//                            cancelTitle: cancelTitle,
+//                            validator: validator
+//                        ) { name, confirmed in
+//                            isPresented = false
+//                            action(name, confirmed)
+//                        }
+//                        .transition(.scale.combined(with: .opacity))
+//                        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isPresented)
+//                    }
+//                }
+//            )
+//    }
+// }

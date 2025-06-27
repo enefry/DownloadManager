@@ -3,7 +3,6 @@ import Combine
 import ConcurrencyCollection
 import DownloadManagerBasic
 import Foundation
-import HTTPChunkDownloadManager
 import LoggerProxy
 
 fileprivate let kLogTag = "DownloadManager"
@@ -300,7 +299,7 @@ actor DownloadManagerActor {
         }
         guard let mgr = getDownloader(task.identifier) else {
             if task.state == .downloading {
-                await task.update(state: .pending)
+                await task.update(state: .paused)
                 await notifyStateUpdate() // 通知外部状态已更新
                 await scheduleNextDownloads() // 暂停后重新调度其他任务
             }
@@ -353,12 +352,22 @@ actor DownloadManagerActor {
         await scheduleNextDownloads() // 恢复后尝试启动下载
     }
 
+    func canStop(_ state: TaskState) -> Bool {
+        return state != .completed
+    }
+
     /// 取消指定标识符的任务
     /// - Parameter identifier: 任务的唯一标识符
     func stopTask(withIdentifier identifier: String, cleanupFile: Bool) async {
-        guard let task = tasks[identifier],
-              let mgr = getDownloader(task.identifier) else {
+        guard let task = tasks[identifier] else {
             LoggerProxy.WLog(tag: kLogTag, msg: "Task not found for cancel: \(identifier)")
+            return
+        }
+        if canStop(task.state) {
+            await task.update(state: .stop)
+        }
+        guard let mgr = getDownloader(task.identifier) else {
+            LoggerProxy.WLog(tag: kLogTag, msg: "Task not found downloader for cancel: \(identifier)")
             return
         }
 
@@ -433,8 +442,10 @@ actor DownloadManagerActor {
     /// 暂停所有下载任务
     func pauseAllTasks() async {
         LoggerProxy.ILog(tag: kLogTag, msg: "Pausing all tasks")
-
         for task in tasks.values {
+            if canPause(task.state) {
+                await task.update(state: .paused)
+            }
             await getDownloader(task.identifier)?.pause()
         }
         await notifyStateUpdate() // 通知外部状态已更新
@@ -457,6 +468,9 @@ actor DownloadManagerActor {
         LoggerProxy.ILog(tag: kLogTag, msg: "Cancelling all tasks")
 
         for task in tasks.values {
+            if canStop(task.state) {
+                await task.update(state: .stop)
+            }
             await cleanupChunkManager(for: task.identifier, cleanupFile: false) // 清理每个任务的分片管理器
         }
 
@@ -617,10 +631,6 @@ actor DownloadManagerActor {
         }
 
         LoggerProxy.ILog(tag: kLogTag, msg: "Starting download for task: \(task.identifier)")
-        let chunkConfig = HTTPChunkDownloadConfiguration(
-            chunkSize: task.taskConfigure.chunkSize,
-            maxConcurrentChunks: task.taskConfigure.maxConcurrentChunks
-        )
         guard let protocolType = task.downloadProtocol(),
               let chunkManager: any Downloader = await configuration.featureImplements.downloaderFactoryCenter.downloader(for: protocolType, task: task, delegate: self) else {
             LoggerProxy.ILog(tag: kLogTag, msg: "can't found downloader for \(task.identifier) ,url=\(task.url)")
@@ -738,14 +748,21 @@ actor DownloadManagerActor {
 
         switch state {
         case .downloading:
+            await task.update(state: .downloading)
             activeTask(withIdentifier: task.identifier)
         case .paused:
+            // 外部主动操作，不再同步
+//            await task.update(state: .paused)
             inactiveTask(withIdentifier: task.identifier)
         case .stop:
+            // 外部主动操作，不再同步
+//            await task.update(state: .stop)
             await finishedAct(false)
         case .completed:
+            await task.update(state: .completed)
             await finishedAct(true)
         case let .failed(error):
+            await task.update(state: .failed(error))
             await finishedAct(false)
             // 处理重试逻辑
             if let retryStrategy = task.taskConfigure.retryStrategy {
