@@ -69,7 +69,7 @@ actor DownloadManagerActor {
     func activeTask(withIdentifier identifier: String) {
         _activeTaskIds.insert(identifier)
         if _activeTaskIds.count > 0,
-           speedTimer != nil {
+           speedTimer == nil {
             setupSpeedTimer()
         }
     }
@@ -143,6 +143,7 @@ actor DownloadManagerActor {
 
     func stopSpeedTimer() {
         speedTimer?.cancel()
+        speedTimer = nil
     }
 
     func onSpeedCalculate() async {
