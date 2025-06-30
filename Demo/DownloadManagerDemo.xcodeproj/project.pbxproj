@@ -11,6 +11,7 @@
 		9B29D4A02E0C325E003B29AC /* DownloadManagerBasic in Frameworks */ = {isa = PBXBuildFile; productRef = 9B29D49F2E0C325E003B29AC /* DownloadManagerBasic */; };
 		9B29D4A22E0C325E003B29AC /* DownloadManagerUI in Frameworks */ = {isa = PBXBuildFile; productRef = 9B29D4A12E0C325E003B29AC /* DownloadManagerUI */; };
 		9B29D4A42E0C325E003B29AC /* HTTPChunkDownloadManager in Frameworks */ = {isa = PBXBuildFile; productRef = 9B29D4A32E0C325E003B29AC /* HTTPChunkDownloadManager */; };
+		9BBD34152E127DC10097BF39 /* LookinServer in Frameworks */ = {isa = PBXBuildFile; platformFilter = ios; productRef = 9BBD34142E127DC10097BF39 /* LookinServer */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -30,6 +31,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9BBD34152E127DC10097BF39 /* LookinServer in Frameworks */,
 				9B29D4A42E0C325E003B29AC /* HTTPChunkDownloadManager in Frameworks */,
 				9B29D49E2E0C325E003B29AC /* DownloadManager in Frameworks */,
 				9B29D4A02E0C325E003B29AC /* DownloadManagerBasic in Frameworks */,
@@ -80,6 +82,7 @@
 				9B29D49F2E0C325E003B29AC /* DownloadManagerBasic */,
 				9B29D4A12E0C325E003B29AC /* DownloadManagerUI */,
 				9B29D4A32E0C325E003B29AC /* HTTPChunkDownloadManager */,
+				9BBD34142E127DC10097BF39 /* LookinServer */,
 			);
 			productName = DownloadManagerDemo;
 			productReference = 9B29D4862E0C3233003B29AC /* DownloadManagerDemo.app */;
@@ -111,6 +114,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				9B29D49C2E0C325E003B29AC /* XCLocalSwiftPackageReference "../../DownloadManager" */,
+				9BBD34132E127DC10097BF39 /* XCRemoteSwiftPackageReference "LookinServer" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9B29D4872E0C3233003B29AC /* Products */;
@@ -367,6 +371,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		9BBD34132E127DC10097BF39 /* XCRemoteSwiftPackageReference "LookinServer" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/QMUI/LookinServer/";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.8;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		9B29D49D2E0C325E003B29AC /* DownloadManager */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -383,6 +398,11 @@
 		9B29D4A32E0C325E003B29AC /* HTTPChunkDownloadManager */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = HTTPChunkDownloadManager;
+		};
+		9BBD34142E127DC10097BF39 /* LookinServer */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9BBD34132E127DC10097BF39 /* XCRemoteSwiftPackageReference "LookinServer" */;
+			productName = LookinServer;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

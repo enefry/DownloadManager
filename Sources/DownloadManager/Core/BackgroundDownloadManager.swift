@@ -1,8 +1,8 @@
-//import Foundation
-//#if canImport(UIKit)
+// import Foundation
+// #if canImport(UIKit)
 //    import UIKit
-//#endif
-//import Combine
+// #endif
+// import Combine
 //
 ///// 后台下载管理器
 /////
@@ -66,7 +66,7 @@
 ///// 3. 管理任务标识符
 ///// 4. 注意内存管理
 ///// 5. 处理应用状态
-//public final class BackgroundDownloadManager: NSObject {
+// public final class BackgroundDownloadManager: NSObject {
 //    // MARK: - 公开属性
 //
 ////    public private(set) var backgroundSession: URLSession!
@@ -204,11 +204,11 @@
 //            self.cleanupTask(taskId)
 //        }
 //    }
-//}
+// }
 //
 //// MARK: - URLSessionDownloadDelegate
 //
-//extension BackgroundDownloadManager: URLSessionDownloadDelegate {
+// extension BackgroundDownloadManager: URLSessionDownloadDelegate {
 //    public func urlSession(
 //        _ session: URLSession,
 //        downloadTask: URLSessionDownloadTask,
@@ -271,14 +271,14 @@
 //            handleDownloadCompletion(taskId: taskId, result: .failure(error))
 //        }
 //    }
-//}
+// }
 //
 //// MARK: - URLSessionDelegate
 //
-//extension BackgroundDownloadManager: URLSessionDelegate {
+// extension BackgroundDownloadManager: URLSessionDelegate {
 //    public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
 //        DispatchQueue.main.async {
 //            self.downloadHandler.notifyDownloadCompleted()
 //        }
 //    }
-//}
+// }

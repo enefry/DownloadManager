@@ -1,20 +1,37 @@
 import Combine
 import ConcurrencyCollection
+import DownloadManagerBasic
 import Foundation
+
+/// 速度记录
+public struct DownloadManagerSpeed: Codable, Sendable, Hashable, Equatable {
+    /// 当前下载速度
+    public let speed: Double
+    /// 预计剩余时长
+    public let remainingTime: TimeInterval
+    public init(speed: Double, remainingTime: TimeInterval) {
+        self.speed = speed
+        self.remainingTime = remainingTime
+    }
+}
 
 /// 下载管理器协议
 public protocol DownloadManagerProtocol {
     /// 获取所有下载任务
     var allTasks: [any DownloadTaskProtocol] { get }
-
+    // 所有任务变化发布者
+    var allTasksPublisher: AnyPublisher<[any DownloadTaskProtocol], Never> { get }
     /// 活动下载任务数量
     var activeTaskCount: Int { get }
+    /// 活动任务数量变化发布者
+    var activeTaskCountPublisher: AnyPublisher<Int, Never> { get }
+    /// 全局速度发布者
+    var progressPublisher: AnyPublisher<DownloadProgress, Never> { get }
+    /// 全局速度发布者
+    var speedPublisher: AnyPublisher<DownloadManagerSpeed, Never> { get }
 
     /// 最大并发下载数
     var maxConcurrentDownloads: Int { get set }
-
-    /// 活动任务数量变化发布者
-    var activeTaskCountPublisher: AnyPublisher<Int, Never> { get }
 
     /// 创建新的下载任务
     /// - Parameters:
@@ -22,8 +39,10 @@ public protocol DownloadManagerProtocol {
     ///   - destination: 目标保存路径
     ///   - configuration: 下载配置
     /// - Returns: 下载任务
+    @discardableResult
     func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?) async -> DownloadTaskProtocol
 
+    @discardableResult
     func download(url: URL, destination: URL, configuration: DownloadTaskConfiguration?, completion: ((any DownloadTaskProtocol) -> Void)?)
 
     /// 获取指定ID的下载任务
@@ -35,7 +54,7 @@ public protocol DownloadManagerProtocol {
     /// - Parameter url: 任务的URL
     /// - Returns: 下载任务，如果不存在则返回nil
     func task(withURL url: URL) -> DownloadTaskProtocol?
-    
+
     // 暂停任务
     /// - Parameter task: 任务
     func pause(task: DownloadTaskProtocol)
@@ -73,8 +92,6 @@ public protocol DownloadManagerProtocol {
     /// - Parameter identifier: 任务ID
     func restart(withIdentifier: String)
 
-    
-    
     // MARK: - 批量操作
 
     /// 暂停所有下载任务

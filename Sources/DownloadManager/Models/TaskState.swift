@@ -111,3 +111,36 @@ public enum TaskState: Codable, Equatable, Hashable, Sendable, CustomStringConve
         }
     }
 }
+
+extension TaskState {
+    // 操作集合 OptionSet 定义
+    struct Op: OptionSet {
+        let rawValue: Int32
+        static let pause = Op(rawValue: 1 << 0)
+        static let resume = Op(rawValue: 1 << 1)
+        static let remove = Op(rawValue: 1 << 2)
+        static let stop = Op(rawValue: 1 << 3)
+        static let restart = Op(rawValue: 1 << 4)
+    }
+
+    //    case pending   可以暂停，可以删除，可以停止
+    //    case downloading       可以暂停，可以删除，可以停止
+    //    case paused            可以恢复，可以删除，可以停止，可以重新开始
+    //    case stop              可以恢复，可以删除，可以停止，可以重新开始
+    //    case completed         可以删除，可以重新开始
+    //    case failed(DownloadError)，可以恢复，可以删除，可以重新开始
+
+    // 替代原始字典，使用函数来根据状态获取操作
+    func allowOperations() -> Op {
+        switch self {
+        case .pending, .downloading:
+            return [.pause, .remove, .stop]
+        case .paused, .stop:
+            return [.resume, .remove, .stop, .restart]
+        case .completed:
+            return [.remove, .restart]
+        case .failed:
+            return [.resume, .remove, .restart]
+        }
+    }
+}

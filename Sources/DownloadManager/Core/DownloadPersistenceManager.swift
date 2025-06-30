@@ -1,4 +1,8 @@
 import Foundation
+import LoggerProxy
+
+private let kLogTag = "DM.PM"
+
 
 /// 下载持久化管理器
 public class DownloadPersistenceManager: DownloadPersistenceManagerProtocol, @unchecked Sendable {

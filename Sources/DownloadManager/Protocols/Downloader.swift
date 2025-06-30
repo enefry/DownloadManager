@@ -10,7 +10,7 @@ import DownloadManagerBasic
 import Foundation
 import LoggerProxy
 
-fileprivate let kLogTag = "DownloaderFactoryCenter"
+fileprivate let kLogTag = "DM.DF"
 
 /// 下载任务协议
 public protocol DownloadTaskProtocol: AnyObject, Sendable {
@@ -34,6 +34,8 @@ public protocol DownloadTaskProtocol: AnyObject, Sendable {
     var progress: DownloadProgress { get }
     /// 进度发布者
     var progressPublisher: AnyPublisher<DownloadProgress, Never> { get }
+    // 速度发布者
+    var speedPublisher: AnyPublisher<DownloadManagerSpeed, Never> { get }
     /// 状态发布者
     var statePublisher: AnyPublisher<TaskState, Never> { get }
 }

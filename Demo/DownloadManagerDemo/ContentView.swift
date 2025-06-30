@@ -11,15 +11,24 @@ import DownloadManagerUI
 import SwiftUI
 
 struct ContentView: View {
+    @FocusState var connectFocos: Bool
+    @FocusState var uaFocos: Bool
+
     @State var manager: DownloadManagerProtocol = CreateDownloadManager()
     @State var text: String = ""
     @State var userAgent: String = ""
     var body: some View {
         VStack {
             HStack {
-                TextField("连接", text: $text)
-                TextField("user-agent", text: $userAgent)
+                VStack {
+                    TextField("连接", text: $text)
+                        .focused($connectFocos)
+                    TextField("user-agent", text: $userAgent)
+                        .focused($uaFocos)
+                }
                 Button("下载") {
+                    connectFocos = false
+                    uaFocos = false
                     if let url = URL(string: text),
                        let name = (text as? NSString)?.lastPathComponent {
                         let dest = FileManager.default.temporaryDirectory.appending(component: name)
@@ -29,19 +38,18 @@ struct ContentView: View {
                                 config.headers["user-agent"] = userAgent
                                 UserDefaults.standard.set(userAgent, forKey: "user-agent")
                             }
-                            await manager.download(url: url, destination: dest, configuration: config)
+                            config.chunkSize = 64 * 1024 * 1024
+                            config.maxConcurrentChunks = 1
+                            _ = await manager.download(url: url, destination: dest, configuration: config)
                         }
                     }
                 }
             }
             DownloadManagerView(manager: manager)
+                .scrollDismissesKeyboard(.automatic)
         }.onAppear(perform: {
             userAgent = UserDefaults.standard.string(forKey: "user-agent") ?? ""
         })
         .padding()
     }
 }
-
-// #Preview {
-//    ContentView()
-// }

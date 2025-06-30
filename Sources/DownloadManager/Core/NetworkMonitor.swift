@@ -1,6 +1,10 @@
 import Combine
 import Foundation
 import Network
+import LoggerProxy
+
+private let kLogTag = "DM.NM"
+
 
 public class NetworkMonitor: NetworkMonitorProtocol, @unchecked Sendable {
     // MARK: - 公开属性

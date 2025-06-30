@@ -2,6 +2,9 @@ import Atomics
 import Combine
 import DownloadManagerBasic
 import Foundation
+import LoggerProxy
+
+fileprivate let kLogTag = "DM.DT"
 
 @propertyWrapper
 public struct DMAtomicInteger<Value: AtomicValue & FixedWidthInteger>: @unchecked Sendable where Value.AtomicRepresentation.Value == Value {
@@ -70,7 +73,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
     }
 
     /// 速度发布者
-    public var speedPublisher: AnyPublisher<Double, Never> {
+    public var speedPublisher: AnyPublisher<DownloadManagerSpeed, Never> {
         speedSubject.eraseToAnyPublisher()
     }
 
@@ -78,7 +81,10 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
 
     /// 发布者的subject
     private let stateSubject: CurrentValueSubject<TaskState, Never>
-    public func update(state: TaskState) async {
+    public func update(state: TaskState, functionName: StaticString = #function, line: Int = #line) async {
+        if case let .failed(error) = state {
+            LoggerProxy.ELog(tag: kLogTag, msg: "更新为错误状态:\(error) ", funcName: functionName, line: line)
+        }
         stateSubject.send(state)
     }
 
@@ -89,8 +95,9 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
     }
 
     /// 速度发布者subject
-    private let speedSubject = CurrentValueSubject<Double, Never>(0)
-    public func update(speed: Double) {
+    private let speedSubject = CurrentValueSubject<DownloadManagerSpeed, Never>(DownloadManagerSpeed(speed: 0, remainingTime: .infinity))
+
+    public func update(speed: DownloadManagerSpeed) {
         speedSubject.send(speed)
     }
 
@@ -116,7 +123,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
         startTime = try container.decode(TimeInterval.self, forKey: .startTime)
         resumeTime = try container.decode(Int64.self, forKey: .resumeTime)
         url = try container.decode(URL.self, forKey: .url)
-        destinationURL = try container.decode(URL.self, forKey: .destinationURL)
+        destinationURL = try URLHelper.urlFor(data: container.decode(Data.self, forKey: .destinationURL))
         downloadedBytes = try container.decode(Int64.self, forKey: .downloadedBytes)
         totalBytes = try container.decode(Int64.self, forKey: .totalBytes)
         let state = try container.decode(TaskState.self, forKey: .state)
@@ -131,7 +138,7 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
         try container.encode(startTime, forKey: .startTime)
         try container.encode(resumeTime, forKey: .resumeTime)
         try container.encode(url, forKey: .url)
-        try container.encode(destinationURL, forKey: .destinationURL)
+        try container.encode(URLHelper.dataFor(url: destinationURL), forKey: .destinationURL)
         try container.encode(downloadedBytes, forKey: .downloadedBytes)
         try container.encode(totalBytes, forKey: .totalBytes)
         try container.encode(stateSubject.value, forKey: .state)
