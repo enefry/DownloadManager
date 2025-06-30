@@ -72,6 +72,7 @@ actor DownloadManagerActor {
 
     /// 状态更新的闭包，用于通知 DownloadManager 更新其公共状态
     private var stateUpdateHandler: (() async -> Void)?
+    private var taskStateChangeHandler: (((any DownloadTaskProtocol, TaskState)) async -> Void)?
     /// 速度更新的timer
     private var speedTimer: Task<Void, Never>?
     /// 全局速度 + 时间预计更新
@@ -189,6 +190,10 @@ actor DownloadManagerActor {
     /// - Parameter handler: 用于更新 DownloadManager 公共状态的闭包
     func setStateUpdateHandler(_ handler: @escaping () async -> Void) {
         stateUpdateHandler = handler
+    }
+
+    func setTaskStateChangeHandler(_ handler: @escaping (((any DownloadTaskProtocol, TaskState)) async -> Void)) {
+        taskStateChangeHandler = handler
     }
 
     func setSpeedUpdateHandler(_ handler: @escaping (DownloadManagerSpeed) async -> Void) {
@@ -565,6 +570,10 @@ actor DownloadManagerActor {
         }
         if taskState != newState {
             await notifyStateUpdate() // 通知外部状态已更新
+        }
+        if let taskStateChangeHandler = taskStateChangeHandler {
+            let tuple: (any DownloadTaskProtocol, TaskState) = (task as DownloadTaskProtocol, newState)
+            await taskStateChangeHandler(tuple)
         }
     }
 

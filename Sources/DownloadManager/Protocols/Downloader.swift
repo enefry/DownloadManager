@@ -126,6 +126,17 @@ public enum DownloaderState: Hashable, Equatable, Sendable, Codable {
             return false
         }
     }
+
+    func toTaskState() -> TaskState {
+        switch self {
+        case .initial: return .pending // 准备中
+        case .downloading: return .downloading // 下载中
+        case .paused: return .paused // 暂停中
+        case .stop: return .stop // 停止
+        case .completed: return .completed // 完成
+        case let .failed(downloadError): return .failed(downloadError) // 失败
+        }
+    }
 }
 
 /// 协议下载器

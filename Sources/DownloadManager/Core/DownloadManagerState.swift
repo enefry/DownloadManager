@@ -27,6 +27,14 @@ public final class DownloadManagerState: ObservableObject {
     /// 全局进度
     @Published public private(set) var progress: DownloadProgress = DownloadProgress(downloadedBytes: 0, totalBytes: 0)
 
+    public private(set) var taskStateNotify = PassthroughSubject<(any DownloadTaskProtocol, TaskState), Never>()
+
+    func sendNotify(taskState: (any DownloadTaskProtocol, TaskState)) {
+        Task { @MainActor in
+            taskStateNotify.send(taskState)
+        }
+    }
+
     /// 更新活跃任务数量
     /// - Parameter count: 新的活跃任务数量
     func updateActiveTaskCount(_ count: Int) {

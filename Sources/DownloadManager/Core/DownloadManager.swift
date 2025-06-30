@@ -26,6 +26,8 @@ public final class DownloadManager: DownloadManagerProtocol, @unchecked Sendable
     public var allTasksPublisher: AnyPublisher<[any DownloadTaskProtocol], Never>
     public var progressPublisher: AnyPublisher<DownloadProgress, Never>
     public var speedPublisher: AnyPublisher<DownloadManagerSpeed, Never>
+    public var stateChangedPublisher: AnyPublisher<(any DownloadTaskProtocol, TaskState), Never>
+
     // 同步获取所有任务列表
     public var allTasks: [any DownloadTaskProtocol] {
         // 直接从状态中获取，因为状态由 Actor 异步更新
@@ -65,6 +67,7 @@ public final class DownloadManager: DownloadManagerProtocol, @unchecked Sendable
         activeTaskCountPublisher = state.$activeTaskCount.eraseToAnyPublisher()
         allTasksPublisher = state.$allTasks.map({ $0.map({ $0 as DownloadTaskProtocol }) }).eraseToAnyPublisher()
         speedPublisher = state.$speed.eraseToAnyPublisher()
+        stateChangedPublisher = state.taskStateNotify.eraseToAnyPublisher()
         progressPublisher = state.$progress.eraseToAnyPublisher()
 
         startup = false
@@ -79,6 +82,12 @@ public final class DownloadManager: DownloadManagerProtocol, @unchecked Sendable
                     return
                 }
                 await self.updateStateFromActor()
+            }
+            await actor.setTaskStateChangeHandler { [weak self] tuple in
+                guard let self = self else {
+                    return
+                }
+                await self.state.sendNotify(taskState: tuple)
             }
             await actor.setSpeedUpdateHandler { [weak self] speed in
                 await self?.onUpdate(speed: speed)

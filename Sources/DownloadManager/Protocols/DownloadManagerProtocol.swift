@@ -29,7 +29,8 @@ public protocol DownloadManagerProtocol {
     var progressPublisher: AnyPublisher<DownloadProgress, Never> { get }
     /// 全局速度发布者
     var speedPublisher: AnyPublisher<DownloadManagerSpeed, Never> { get }
-
+    /// 任务状态变化通知
+    var stateChangedPublisher: AnyPublisher<(any DownloadTaskProtocol, TaskState), Never> { get }
     /// 最大并发下载数
     var maxConcurrentDownloads: Int { get set }
 

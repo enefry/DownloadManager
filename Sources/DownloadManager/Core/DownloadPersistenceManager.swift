@@ -3,12 +3,11 @@ import LoggerProxy
 
 private let kLogTag = "DM.PM"
 
-
 /// 下载持久化管理器
 public class DownloadPersistenceManager: DownloadPersistenceManagerProtocol, @unchecked Sendable {
     var workingDirectoryName: String = "DownloadManager"
     public func setup(configure: DownloadManagerConfiguration) async {
-        workingDirectoryName = "DownloadManager-\(configure.name)"
+        workingDirectoryName = configure.name.isEmpty ? "DownloadManager" : "DownloadManager-\(configure.name)"
         createDirectoryIfNeeded()
     }
 
@@ -18,7 +17,7 @@ public class DownloadPersistenceManager: DownloadPersistenceManagerProtocol, @un
     private let queue = DispatchQueue(label: "com.downloadmanager.persistence", qos: .utility)
 
     private var persistenceURL: URL {
-        let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let documentsPath = fileManager.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         return documentsPath.appendingPathComponent(workingDirectoryName)
             .appendingPathComponent("tasks.json")
     }
