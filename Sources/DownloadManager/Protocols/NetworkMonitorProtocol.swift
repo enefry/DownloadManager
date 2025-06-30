@@ -2,7 +2,7 @@
 //  NetworkMonitorProtocol.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/21.
+//  Created by chen on 2025/6/21.
 //
 
 import Combine
@@ -22,7 +22,7 @@ public enum NetworkStatus {
     case connected(NetworkType)
     case disconnected
     case restricted
-}   
+}
 
 public protocol NetworkMonitorProtocol {
     var status: NetworkStatus { get }

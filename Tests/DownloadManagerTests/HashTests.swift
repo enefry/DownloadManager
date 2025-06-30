@@ -2,7 +2,7 @@
 //  HashTests.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/20.
+//  Created by chen on 2025/6/20.
 //
 
 import CryptoKit
@@ -56,7 +56,7 @@ final class HashTests: XCTestCase {
         let fileResult = try! IntegrityChecker.calculateHash(for: tempFile, type: .crc32)
         XCTAssertEqual(crc32.lowercased(), fileResult.lowercased())
     }
-    
+
     func testMD5() {
         XCTAssertEqual(md5.lowercased(), text.dm_md5().lowercased())
         XCTAssertEqual(md5.lowercased(), data.dm_md5().lowercased())
@@ -64,51 +64,51 @@ final class HashTests: XCTestCase {
         XCTAssertEqual(md5.lowercased(), fileResult.lowercased())
         fileResult = try! IntegrityChecker.calculateHash(for: largeFile, type: .md5)
         XCTAssertEqual(large_md5.lowercased(), fileResult.lowercased())
-        
+
     }
 
     func testsha1() {
         XCTAssertEqual(sha1.lowercased(), text.dm_sha1().lowercased())
         XCTAssertEqual(sha1.lowercased(), data.dm_sha1().lowercased())
-        
+
         var fileResult = try! IntegrityChecker.calculateHash(for: tempFile, type: .sha1)
         XCTAssertEqual(sha1.lowercased(), fileResult.lowercased())
         fileResult = try! IntegrityChecker.calculateHash(for: largeFile, type: .sha1)
         XCTAssertEqual(large_sha1.lowercased(), fileResult.lowercased())
-        
+
     }
 
     func testsha256() {
         XCTAssertEqual(sha256.lowercased(), text.dm_sha256().lowercased())
         XCTAssertEqual(sha256.lowercased(), data.dm_sha256().lowercased())
-        
+
         var fileResult = try! IntegrityChecker.calculateHash(for: tempFile, type: .sha256)
         XCTAssertEqual(sha256.lowercased(), fileResult.lowercased())
         fileResult = try! IntegrityChecker.calculateHash(for: largeFile, type: .sha256)
         XCTAssertEqual(large_sha256.lowercased(), fileResult.lowercased())
-        
+
     }
 
     func testsha384() {
         XCTAssertEqual(sha384.lowercased(), text.dm_sha384().lowercased())
         XCTAssertEqual(sha384.lowercased(), data.dm_sha384().lowercased())
-        
+
         var fileResult = try! IntegrityChecker.calculateHash(for: tempFile, type: .sha384)
         XCTAssertEqual(sha384.lowercased(), fileResult.lowercased())
         fileResult = try! IntegrityChecker.calculateHash(for: largeFile, type: .sha384)
         XCTAssertEqual(large_sha384.lowercased(), fileResult.lowercased())
-        
+
     }
 
     func testsha512() {
         XCTAssertEqual(sha512.lowercased(), text.dm_sha512().lowercased())
         XCTAssertEqual(sha512.lowercased(), data.dm_sha512().lowercased())
-        
+
         var fileResult = try! IntegrityChecker.calculateHash(for: tempFile, type: .sha512)
         XCTAssertEqual(sha512.lowercased(), fileResult.lowercased())
         fileResult = try! IntegrityChecker.calculateHash(for: largeFile, type: .sha512)
         XCTAssertEqual(large_sha512.lowercased(), fileResult.lowercased())
-        
+
     }
 
     override func tearDown() {

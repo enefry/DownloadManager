@@ -2,7 +2,7 @@
 //  String+Hash.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/15.
+//  Created by chen on 2025/6/15.
 //
 
 import CryptoKit // 重新引入 CryptoKit，用于 sha256() 实现

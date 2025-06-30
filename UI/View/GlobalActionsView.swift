@@ -2,7 +2,7 @@
 //  GlobalActionsView.swift
 //  DownloadManagerDemo
 //
-//  Created by 陈任伟 on 2025/6/30.
+//  Created by chen on 2025/6/30.
 //
 
 import Combine

@@ -2,7 +2,7 @@
 //  DownloadManager_HTTPDownloader.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/25.
+//  Created by chen on 2025/6/25.
 //
 
 import DownloadManager

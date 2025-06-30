@@ -2,7 +2,7 @@
 //  URLHelper.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/30.
+//  Created by chen on 2025/6/30.
 //
 
 import Foundation
@@ -28,7 +28,7 @@ private struct URLData: Codable {
     let relativePath: String?      // 相对于父目录的路径
     let creationDate: Date
     let isRemote: Bool
-    
+
     enum CodingKeys: String, CodingKey {
         case urlString, isFileURL, bookmarkData, parentBookmarkData, relativePath, creationDate, isRemote
     }
@@ -38,9 +38,9 @@ public class URLHelper {
     // 使用线程安全的访问控制
     private static let queue = DispatchQueue(label: "URLHelper.queue", attributes: .concurrent)
     private static var _accessingURLs: Set<URL> = []
-    
+
     // MARK: - Access Management
-    
+
     /// 开始访问 security-scoped resource（仅 macOS）
     /// - Parameter url: 需要访问的文件 URL
     /// - Returns: 是否成功开始访问
@@ -51,13 +51,13 @@ public class URLHelper {
         guard url.isFileURL else {
             throw URLHelperError.invalidURL
         }
-        
+
         return try queue.sync(flags: .barrier) {
             // 检查是否已经在访问
             if _accessingURLs.contains(url) {
                 throw URLHelperError.alreadyAccessing
             }
-            
+
 #if os(macOS)
             // macOS 需要显式管理 security-scoped resource
             let success = url.startAccessingSecurityScopedResource()
@@ -76,7 +76,7 @@ public class URLHelper {
 #endif
         }
     }
-    
+
     /// 停止访问 security-scoped resource（仅 macOS）
     /// - Parameter url: 需要停止访问的文件 URL
     /// - Throws: URLHelperError.notAccessing 如果没有在访问该 URL
@@ -86,16 +86,16 @@ public class URLHelper {
             guard _accessingURLs.contains(url) else {
                 throw URLHelperError.notAccessing
             }
-            
+
 #if os(macOS)
             url.stopAccessingSecurityScopedResource()
 #endif
-            
+
             _accessingURLs.remove(url)
             print("🛑 Stopped accessing: \(url.lastPathComponent)")
         }
     }
-    
+
     /// 安全地停止访问（不抛出异常）
     /// - Parameter url: 需要停止访问的文件 URL
     /// - Returns: 是否成功停止访问
@@ -108,27 +108,27 @@ public class URLHelper {
             return false
         }
     }
-    
+
     /// 检查 URL 是否正在被访问
     /// - Parameter url: 要检查的 URL
     /// - Returns: 是否正在访问
     public static func isAccessing(url: URL) -> Bool {
         return queue.sync { _accessingURLs.contains(url) }
     }
-    
+
     /// 获取当前正在访问的所有 URL
     /// - Returns: 正在访问的 URL 集合
     public static func getAccessingURLs() -> Set<URL> {
         return queue.sync { _accessingURLs }
     }
-    
+
     /// 停止访问所有 URL
     /// - Returns: 成功停止访问的 URL 数量
     @discardableResult
     public static func stopAllAccess() -> Int {
         return queue.sync(flags: .barrier) {
             let count = _accessingURLs.count
-            
+
 #if os(macOS)
             for url in _accessingURLs {
                 url.stopAccessingSecurityScopedResource()
@@ -139,14 +139,14 @@ public class URLHelper {
                 print("🛑 Stopped accessing: \(url.lastPathComponent)")
             }
 #endif
-            
+
             _accessingURLs.removeAll()
             return count
         }
     }
-    
+
     // MARK: - Enhanced Bookmark Operations
-    
+
     /// 为任意 URL 生成保存数据（支持不存在的文件）
     /// - Parameter url: 要保存的 URL
     /// - Returns: 序列化的 URL 数据
@@ -165,11 +165,11 @@ public class URLHelper {
             )
             return try JSONEncoder().encode(urlData)
         }
-        
+
         // 文件 URL 处理
         return try createFileURLData(for: url)
     }
-    
+
     /// 通过保存的数据恢复 URL
     /// - Parameter data: 保存的 URL 数据
     /// - Returns: 恢复的 URL
@@ -180,11 +180,11 @@ public class URLHelper {
         if let urlData = try? JSONDecoder().decode(URLData.self, from: data) {
             return try restoreURL(from: urlData)
         }
-        
+
         // 兼容旧格式（纯字符串或 bookmark）
         return try legacyURLRestore(from: data)
     }
-    
+
     /// 检查保存的 URL 数据是否仍然有效
     /// - Parameter data: 保存的 URL 数据
     /// - Returns: 是否有效
@@ -196,7 +196,7 @@ public class URLHelper {
             return false
         }
     }
-    
+
     /// 尝试刷新过期的 URL 数据
     /// - Parameter data: 可能过期的 URL 数据
     /// - Returns: 刷新后的 URL 数据，如果无法刷新则返回 nil
@@ -216,12 +216,12 @@ public class URLHelper {
         }
         return nil
     }
-    
+
     // MARK: - Private Methods
-    
+
     private static func createFileURLData(for url: URL) throws -> Data {
         let fileExists = FileManager.default.fileExists(atPath: url.path)
-        
+
         if fileExists {
             // 文件存在，创建常规 bookmark
             return try createExistingFileData(for: url)
@@ -230,12 +230,12 @@ public class URLHelper {
             return try createNonExistingFileData(for: url)
         }
     }
-    
+
     private static func createExistingFileData(for url: URL) throws -> Data {
         // 临时获取访问权限用于创建 bookmark
         let needsTemporaryAccess = !isAccessing(url: url)
         var temporaryAccess = false
-        
+
         if needsTemporaryAccess {
 #if os(macOS)
             temporaryAccess = url.startAccessingSecurityScopedResource()
@@ -243,7 +243,7 @@ public class URLHelper {
             temporaryAccess = true
 #endif
         }
-        
+
         defer {
 #if os(macOS)
             if temporaryAccess {
@@ -251,24 +251,24 @@ public class URLHelper {
             }
 #endif
         }
-        
+
         do {
             // iOS 和 macOS 使用不同的 bookmark 选项
             var options: URL.BookmarkCreationOptions = []
-            
+
 #if os(macOS)
             let hasSecurityScope = temporaryAccess || isAccessing(url: url)
             if hasSecurityScope {
                 options = [.withSecurityScope, .securityScopeAllowOnlyReadAccess]
             }
 #endif
-            
+
             let bookmarkData = try url.bookmarkData(
                 options: options,
                 includingResourceValuesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
                 relativeTo: nil
             )
-            
+
             let urlData = URLData(
                 urlString: url.path,
                 isFileURL: true,
@@ -278,33 +278,33 @@ public class URLHelper {
                 creationDate: Date(),
                 isRemote: false
             )
-            
+
             return try JSONEncoder().encode(urlData)
-            
+
         } catch {
             print("❌ Bookmark creation failed for \(url.lastPathComponent): \(error)")
             throw URLHelperError.bookmarkCreationFailed
         }
     }
-    
+
     private static func createNonExistingFileData(for url: URL) throws -> Data {
         let parentURL = url.deletingLastPathComponent()
         let fileName = url.lastPathComponent
-        
+
         // 检查父目录是否存在
         guard FileManager.default.fileExists(atPath: parentURL.path) else {
             throw URLHelperError.parentDirectoryNotFound
         }
-        
+
         // 检查父目录是否有写权限
         guard FileManager.default.isWritableFile(atPath: parentURL.path) else {
             throw URLHelperError.noWritePermission
         }
-        
+
         // 为父目录创建 bookmark
         let needsTemporaryAccess = !isAccessing(url: parentURL)
         var temporaryAccess = false
-        
+
         if needsTemporaryAccess {
 #if os(macOS)
             temporaryAccess = parentURL.startAccessingSecurityScopedResource()
@@ -312,7 +312,7 @@ public class URLHelper {
             temporaryAccess = true
 #endif
         }
-        
+
         defer {
 #if os(macOS)
             if temporaryAccess {
@@ -320,22 +320,22 @@ public class URLHelper {
             }
 #endif
         }
-        
+
         do {
             var options: URL.BookmarkCreationOptions = []
-            
+
 #if os(macOS)
             if temporaryAccess || isAccessing(url: parentURL) {
                 options = [.withSecurityScope]
             }
 #endif
-            
+
             let parentBookmarkData = try parentURL.bookmarkData(
                 options: options,
                 includingResourceValuesForKeys: [.isDirectoryKey],
                 relativeTo: nil
             )
-            
+
             let urlData = URLData(
                 urlString: url.path,
                 isFileURL: true,
@@ -345,15 +345,15 @@ public class URLHelper {
                 creationDate: Date(),
                 isRemote: false
             )
-            
+
             return try JSONEncoder().encode(urlData)
-            
+
         } catch {
             print("❌ Parent bookmark creation failed for \(parentURL.lastPathComponent): \(error)")
             throw URLHelperError.bookmarkCreationFailed
         }
     }
-    
+
     private static func restoreURL(from urlData: URLData) throws -> URL {
         if urlData.isRemote {
             // 远程 URL
@@ -362,7 +362,7 @@ public class URLHelper {
             }
             return url
         }
-        
+
         // 文件 URL
         if let bookmarkData = urlData.bookmarkData {
             // 存在文件的 bookmark
@@ -379,61 +379,61 @@ public class URLHelper {
             return URL(fileURLWithPath: urlData.urlString)
         }
     }
-    
+
     private static func resolveFileBookmark(data: Data) throws -> URL {
         var isStale = false
-        
+
         do {
 #if os(macOS)
             let options: URL.BookmarkResolutionOptions = [.withoutUI, .withSecurityScope]
 #else
             let options: URL.BookmarkResolutionOptions = [.withoutUI]
 #endif
-            
+
             let url = try URL(
                 resolvingBookmarkData: data,
                 options: options,
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             )
-            
+
             if isStale {
                 print("⚠️ Bookmark is stale for URL: \(url.lastPathComponent)")
                 throw URLHelperError.staleBookmark
             }
-            
+
             print("✅ Resolved bookmark for: \(url.lastPathComponent)")
             return url
-            
+
         } catch {
             print("❌ Bookmark resolution failed: \(error)")
             throw URLHelperError.bookmarkResolutionFailed
         }
     }
-    
+
     private static func resolveNonExistingFileURL(parentBookmarkData: Data, relativePath: String) throws -> URL {
         // 首先恢复父目录
         let parentURL = try resolveFileBookmark(data: parentBookmarkData)
-        
+
         // 组合完整路径
         let fileURL = parentURL.appendingPathComponent(relativePath)
-        
+
         print("✅ Resolved non-existing file URL: \(fileURL.lastPathComponent)")
         return fileURL
     }
-    
+
     private static func legacyURLRestore(from data: Data) throws -> URL {
         // 尝试当作 bookmark 解析
         if let url = try? resolveFileBookmark(data: data) {
             return url
         }
-        
+
         // 尝试当作字符串解析
         guard let urlString = String(data: data, encoding: .utf8),
               let url = URL(string: urlString) else {
             throw URLHelperError.bookmarkResolutionFailed
         }
-        
+
         return url
     }
 }
@@ -459,7 +459,7 @@ extension URLHelper {
             return url.scheme != nil && url.host != nil
         }
     }
-    
+
     /// 便捷方法：安全地获取文件 URL 的资源值
     /// - Parameters:
     ///   - url: 文件 URL
@@ -471,15 +471,15 @@ extension URLHelper {
         guard url.isFileURL else {
             throw URLHelperError.invalidURL
         }
-        
+
         // 只有文件存在时才能获取资源值
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw URLHelperError.invalidURL
         }
-        
+
         let needsTemporaryAccess = !isAccessing(url: url)
         var temporaryAccess = false
-        
+
         if needsTemporaryAccess {
 #if os(macOS)
             temporaryAccess = url.startAccessingSecurityScopedResource()
@@ -487,7 +487,7 @@ extension URLHelper {
             temporaryAccess = true
 #endif
         }
-        
+
         defer {
 #if os(macOS)
             if temporaryAccess {
@@ -495,10 +495,10 @@ extension URLHelper {
             }
 #endif
         }
-        
+
         return try url.resourceValues(forKeys: keys)
     }
-    
+
     /// 便捷方法：在闭包中安全地访问文件 URL
     /// - Parameters:
     ///   - url: 文件 URL
@@ -507,20 +507,20 @@ extension URLHelper {
     /// - Throws: URLHelperError 或闭包抛出的错误
     public static func withAccess<T>(to url: URL, _ block: (URL) throws -> T) throws -> T {
         let wasAccessing = isAccessing(url: url)
-        
+
         if !wasAccessing {
             try startAccess(for: url)
         }
-        
+
         defer {
             if !wasAccessing {
                 stopAccessSafely(for: url)
             }
         }
-        
+
         return try block(url)
     }
-    
+
     /// 便捷方法：创建文件并返回可访问的 URL
     /// - Parameters:
     ///   - url: 目标文件 URL
@@ -531,20 +531,20 @@ extension URLHelper {
         guard url.isFileURL else {
             throw URLHelperError.invalidURL
         }
-        
+
         // 确保父目录存在
         let parentURL = url.deletingLastPathComponent()
         if !FileManager.default.fileExists(atPath: parentURL.path) {
             try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true)
         }
-        
+
         // 写入文件
         try data.write(to: url)
-        
+
         print("✅ Created file: \(url.lastPathComponent)")
         return url
     }
-    
+
     /// 便捷方法：安全地创建或写入文件
     /// - Parameters:
     ///   - url: 目标文件 URL
@@ -556,13 +556,13 @@ extension URLHelper {
         let createdURL = try createFile(at: url, with: data)
         return try withAccess(to: createdURL, block)
     }
-    
+
     /// 便捷方法：批量保存 URL 数据
     /// - Parameter urls: URL 数组
     /// - Returns: 成功保存的数据字典 [URL: Data]
     public static func batchSaveURLs(_ urls: [URL]) -> [URL: Data] {
         var results: [URL: Data] = [:]
-        
+
         for url in urls {
             do {
                 let data = try dataFor(url: url)
@@ -571,7 +571,7 @@ extension URLHelper {
                 print("❌ Failed to save URL \(url.lastPathComponent): \(error)")
             }
         }
-        
+
         return results
     }
 }
@@ -585,16 +585,16 @@ extension URLHelper {
         let accessing = getAccessingURLs()
         print("🔍 URLHelper Debug Status:")
         print("📊 Currently accessing \(accessing.count) URLs:")
-        
+
         for url in accessing {
             print("  📁 \(url.lastPathComponent) - \(url.path)")
         }
-        
+
         if accessing.isEmpty {
             print("  (No URLs currently being accessed)")
         }
     }
-    
+
     /// 调试：打印指定 URL 的状态
     /// - Parameter url: 要检查的 URL
     public static func debugPrintStatus(for url: URL) {
@@ -605,12 +605,12 @@ extension URLHelper {
         print("  🌐 Is file URL: \(url.isFileURL)")
         print("  ✅ Is accessible: \(isAccessible(url: url))")
     }
-    
+
     /// 调试：分析保存的 URL 数据
     /// - Parameter data: 保存的数据
     public static func debugAnalyzeData(_ data: Data) {
         print("🔍 URL Data Analysis:")
-        
+
         if let urlData = try? JSONDecoder().decode(URLData.self, from: data) {
             print("  📋 Format: New JSON format")
             print("  🌐 Is remote: \(urlData.isRemote)")

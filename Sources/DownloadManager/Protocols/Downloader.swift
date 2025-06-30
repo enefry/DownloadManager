@@ -2,7 +2,7 @@
 //  Downloader.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/22.
+//  Created by chen on 2025/6/22.
 //
 import Combine
 import ConcurrencyCollection

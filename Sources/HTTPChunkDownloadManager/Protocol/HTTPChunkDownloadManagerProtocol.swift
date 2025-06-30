@@ -2,7 +2,7 @@
 //  HTTPChunkDownloadManagerProtocol.swift
 //  DownloadManager
 //
-//  Created by 陈任伟 on 2025/6/20.
+//  Created by chen on 2025/6/20.
 //
 
 import Combine
