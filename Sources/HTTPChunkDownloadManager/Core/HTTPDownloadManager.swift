@@ -1,6 +1,7 @@
 import Combine
 import ConcurrencyCollection
 import CryptoKit
+import Darwin.C // 引入 C 标准库，包含 open/read/write/close 等函数
 import DownloadManagerBasic
 import Foundation
 import LoggerProxy
@@ -128,16 +129,17 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
                     completionHandler(.cancel)
                     return
                 }
+            } else {
+                completionHandler(.cancel)
+                return
             }
 
             // 准备文件写入
             do {
                 try prepareFileForWriting()
-                completionHandler(.allow)
             } catch {
                 LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) failed to prepare file: \(error)")
                 sendCompletion(.failure(error))
-                completionHandler(.cancel)
             }
         }
 
@@ -1167,6 +1169,11 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         await update(state: .merging) // 直接调用，不需要 await
 
         let tempMergeFile = tempDirectory.appendingPathComponent("final_merged_file.tmp")
+        let chunkFiles = chunkTasks.sorted(by: { $0.start < $1.start }).map({ $0.filePath.path })
+
+        // 使用 256k~4m 块，进行文件合并
+        let bufferSize = Int(min(max(configuration.chunkSize, 256 * 1024), 4 * 1024 * 1024)) // 256~1m
+
         /// 删除
         if FileManager.default.fileExists(atPath: tempMergeFile.path) {
             try FileManager.default.removeItem(at: tempMergeFile)
@@ -1183,22 +1190,25 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             try validateChunk(chunkTask)
         }
 
-        // 创建合并文件
-        FileManager.default.createFile(atPath: tempMergeFile.path, contents: nil)
-        let fileHandle = try FileHandle(forWritingTo: tempMergeFile)
-        defer { try? fileHandle.close() }
+        // 使用 open方式合并，更加高效
+        try mergeFilesWithPOSIXOpen(sourceFilePaths: chunkFiles, destinationFilePath: tempMergeFile.path, bufferSize: bufferSize)
 
-        /// 按照开始顺序，写入
-        for chunkTask in chunkTasks.sorted(by: { $0.start < $1.start }) {
-            let chunkHandle = try FileHandle(forReadingFrom: chunkTask.filePath)
-            defer { try? chunkHandle.close() }
-
-            // 使用 128k 块，进行文件合并
-            let bufferSize = Int(min(max(configuration.chunkSize, 128 * 1024), 1 * 1024 * 1024)) // 128k ~ 1m
-            while let data = try chunkHandle.read(upToCount: bufferSize) {
-                try fileHandle.write(contentsOf: data)
-            }
-        }
+//        // 创建合并文件
+//        FileManager.default.createFile(atPath: tempMergeFile.path, contents: nil)
+//        let fileHandle = try FileHandle(forWritingTo: tempMergeFile)
+//        defer { try? fileHandle.close() }
+//
+//        /// 按照开始顺序，写入
+//        for chunkTask in chunkTasks.sorted(by: { $0.start < $1.start }) {
+//            let chunkHandle = try FileHandle(forReadingFrom: chunkTask.filePath)
+//            defer { try? chunkHandle.close() }
+//
+//            try autoreleasepool {
+//                while let data = try chunkHandle.read(upToCount: bufferSize) {
+//                    try fileHandle.write(contentsOf: data)
+//                }
+//            }
+//        }
 
         let destinationDirectory = downloadTask.destinationURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
@@ -1208,6 +1218,109 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             try FileManager.default.removeItem(at: downloadTask.destinationURL)
         }
         try FileManager.default.moveItem(at: tempMergeFile, to: downloadTask.destinationURL)
+    }
+
+    // 定义一个错误枚举，以便更清晰地表示可能发生的错误
+    enum POSIXFileMergeError: Error {
+        case cannotOpenFile(String, Int32) // 文件路径, errno
+        case cannotCreateFile(String, Int32)
+        case readError(String, Int32)
+        case writeError(String, Int32)
+        case partialWriteError(String, Int, Int) // 文件路径, 期望写入字节数, 实际写入字节数
+    }
+
+    /// 使用 POSIX open/read/write 接口高效合并多个文件。
+    /// - Parameters:
+    ///   - sourceFilePaths: 包含所有源文件路径的数组。
+    ///   - destinationFilePath: 合并后的目标文件路径。
+    ///   - bufferSize: 用于读写操作的缓冲区大小（字节）。默认为 64KB。
+    /// - Throws: 如果文件操作失败，则抛出 POSIXFileMergeError。
+    func mergeFilesWithPOSIXOpen(sourceFilePaths: [String], destinationFilePath: String, bufferSize: Int = 64 * 1024) throws {
+        let fileManager = FileManager.default
+
+        // 1. 确保目标文件不存在，如果存在则删除
+        if fileManager.fileExists(atPath: destinationFilePath) {
+            do {
+                try fileManager.removeItem(atPath: destinationFilePath)
+            } catch {
+                LoggerProxy.ELog(tag: kLogTag, msg: "警告: 无法删除现有目标文件 \(destinationFilePath): \(error.localizedDescription)")
+                // 可以选择在这里抛出错误，或继续尝试写入（这会覆盖文件）
+            }
+        }
+
+        // 2. 打开或创建目标文件以便写入
+        // O_WRONLY: 只写模式
+        // O_CREAT: 如果文件不存在则创建
+        // O_TRUNC: 如果文件存在则清空其内容
+        // S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH: 设置文件权限 (用户读写，组和其他只读)
+        let destFD = open(destinationFilePath, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        if destFD == -1 {
+            throw POSIXFileMergeError.cannotCreateFile(destinationFilePath, errno)
+        }
+
+        // 确保在函数退出时关闭目标文件描述符
+        defer {
+            close(destFD)
+        }
+
+        // 3. 分配一个预分配的缓冲区
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bufferSize, alignment: MemoryLayout<UInt8>.alignment)
+        // 确保在函数退出时释放这块内存
+        defer {
+            buffer.deallocate()
+        }
+
+        // 4. 遍历源文件并逐一合并
+        for sourcePath in sourceFilePaths {
+            LoggerProxy.DLog(tag: kLogTag, msg: "正在合并文件: \(sourcePath)")
+
+            // 打开源文件进行读取
+            let sourceFD = open(sourcePath, O_RDONLY)
+            let errcode = errno
+            if sourceFD == -1 {
+                LoggerProxy.WLog(tag: kLogTag, msg: "警告: 无法打开源文件 \(sourcePath)，跳过。错误: \(String(cString: strerror(errcode)))")
+                throw POSIXFileMergeError.cannotOpenFile(sourcePath, errcode)
+            }
+
+            // 确保在处理完当前源文件后关闭其文件描述符
+            defer {
+                close(sourceFD)
+            }
+
+            do {
+                while true {
+                    // 从源文件读取数据到缓冲区
+                    // read 函数返回实际读取的字节数，-1 表示错误，0 表示文件结束
+                    let bytesRead = read(sourceFD, buffer.baseAddress!, bufferSize)
+
+                    if bytesRead == -1 {
+                        throw POSIXFileMergeError.readError(sourcePath, errno)
+                    }
+
+                    if bytesRead == 0 {
+                        // 读取到文件末尾
+                        break
+                    }
+
+                    // 将缓冲区中的数据写入目标文件
+                    let bytesWritten = write(destFD, buffer.baseAddress!, bytesRead)
+
+                    if bytesWritten == -1 {
+                        throw POSIXFileMergeError.writeError(destinationFilePath, errno)
+                    }
+
+                    if bytesWritten != bytesRead {
+                        // 写入的字节数少于读取的字节数，表示部分写入或错误
+                        throw POSIXFileMergeError.partialWriteError(destinationFilePath, bytesRead, bytesWritten)
+                    }
+                }
+            } catch {
+                LoggerProxy.ELog(tag: kLogTag, msg: "处理文件时发生错误 for \(sourcePath): \(error.localizedDescription)")
+                // 可以选择抛出错误或继续处理下一个文件
+            }
+        }
+
+        LoggerProxy.DLog(tag: kLogTag, msg: "所有文件合并完成到: \(destinationFilePath)")
     }
 
     private func checkDiskSpace(requiredSpace: Int64, destinationURL: URL) throws {
