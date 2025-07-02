@@ -59,7 +59,7 @@ public enum RetryStrategy: Codable, Equatable, Hashable, Sendable {
 
     public static func == (lhs: RetryStrategy, rhs: RetryStrategy) -> Bool {
         switch (lhs, rhs) {
-        case let (.fixed(interval1, maxAttempts1), .fixed(interval2, maxAttempts2),):
+        case let (.fixed(interval1, maxAttempts1), .fixed(interval2, maxAttempts2)):
             return interval1 == interval2 && maxAttempts1 == maxAttempts2
         case let (.exponential(baseInterval1, maxAttempts1, maxInterval1), .exponential(baseInterval2, maxAttempts2, maxInterval2)):
             return baseInterval1 == baseInterval2 && maxAttempts1 == maxAttempts2 && maxInterval1 == maxInterval2

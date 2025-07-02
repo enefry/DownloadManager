@@ -69,7 +69,6 @@ let package = Package(
                 ],
                 path: "Sources/DownloadManager_HTTPDownloader"
                ),
-        /// 下载任务管理界面
         .target(
             name: "DownloadManagerUI",
             dependencies: [
@@ -81,12 +80,11 @@ let package = Package(
                 .product(name: "LoggerProxy",package: "LoggerProxy"),
                 .product(name: "Atomics",package: "swift-atomics"),
             ],
-            path: "UI",
+            path: "UI"
         ),
-        /// 单元测试
         .testTarget(
             name: "DownloadManagerTests",
-            dependencies: ["DownloadManager"],
-        ),
+            dependencies: ["DownloadManager"]
+        )
     ]
 )
