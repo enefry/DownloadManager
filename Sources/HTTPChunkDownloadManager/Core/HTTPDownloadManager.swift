@@ -116,31 +116,30 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
         // MARK: - URLSessionDataDelegate
 
-        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse) async -> URLSession.ResponseDisposition {
             LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) received response: \(response)")
 
             // 验证响应状态码
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 206 || httpResponse.statusCode == 200 {
-                    // 206 Partial Content 或 200 OK
-                    completionHandler(.allow)
+                    do {
+                        try prepareFileForWriting()
+                    } catch {
+                        LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) failed to prepare file: \(error)")
+                        sendCompletion(.failure(error))
+                        return .cancel
+                    }
                 } else {
                     LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) unexpected status code: \(httpResponse.statusCode)")
-                    completionHandler(.cancel)
-                    return
+                    sendCompletion(.failure(DownloadError.networkError("响应码：\(httpResponse.statusCode)")))
+                    return .cancel
                 }
             } else {
-                completionHandler(.cancel)
-                return
+                sendCompletion(.failure(DownloadError.invalidResponse))
+                return .cancel
             }
 
-            // 准备文件写入
-            do {
-                try prepareFileForWriting()
-            } catch {
-                LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) failed to prepare file: \(error)")
-                sendCompletion(.failure(error))
-            }
+            return .allow
         }
 
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {

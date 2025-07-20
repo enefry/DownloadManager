@@ -683,9 +683,8 @@ extension DownloadManagerActor: DownloaderDelegate {
               await hasActiveTask(withIdentifier: task.identifier) else {
             return
         }
-        Task {
-            await self.handleTaskStateChange(task: task, state: state)
-        }
+        await self.handleTaskStateChange(task: task, state: state)
+        
     }
 
     nonisolated func downloader(_ downloader: any Downloader, didCompleteWith task: any DownloadTaskProtocol) async {

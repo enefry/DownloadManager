@@ -49,7 +49,7 @@ public struct DownloadError: Error, CustomStringConvertible, Codable, Sendable, 
     public static let serverNotSupported = DownloadError(code: -4, description: "服务器不支持")
     public static let insufficientDiskSpace = DownloadError(code: -5, description: "磁盘空间不足")
     public static let invalidResponse = DownloadError(code: -6, description: "服务器返回无效响应")
-
+    
     public static func networkError(_ desc: String) -> DownloadError {
         return .init(code: -7, description: desc)
     }

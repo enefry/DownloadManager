@@ -83,6 +83,9 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
     private let stateSubject: CurrentValueSubject<TaskState, Never>
     public func update(state: TaskState, functionName: StaticString = #function, line: Int = #line) async {
         if case let .failed(error) = state {
+            if error == .cancelled{
+                print("取消？？？")
+            }
             LoggerProxy.ELog(tag: kLogTag, msg: "更新为错误状态:\(error) ", funcName: functionName, line: line)
         }
         stateSubject.send(state)

@@ -29,8 +29,8 @@ public final class DownloadManagerState: ObservableObject {
 
     public private(set) var taskStateNotify = PassthroughSubject<(any DownloadTaskProtocol, TaskState), Never>()
 
-    func sendNotify(taskState: (any DownloadTaskProtocol, TaskState)) {
-        Task { @MainActor in
+    func sendNotify(taskState: (any DownloadTaskProtocol, TaskState)) async {
+        await MainActor.run {
             taskStateNotify.send(taskState)
         }
     }
