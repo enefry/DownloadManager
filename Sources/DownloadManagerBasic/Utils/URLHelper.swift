@@ -292,8 +292,8 @@ public class URLHelper {
         let fileName = url.lastPathComponent
 
         // 检查父目录是否存在
-        guard FileManager.default.fileExists(atPath: parentURL.path) else {
-            throw URLHelperError.parentDirectoryNotFound
+        if !FileManager.default.fileExists(atPath: parentURL.path){
+            try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true)
         }
 
         // 检查父目录是否有写权限
