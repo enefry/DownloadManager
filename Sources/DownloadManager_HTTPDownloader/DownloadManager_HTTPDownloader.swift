@@ -66,7 +66,10 @@ class HTTPChunkDownloadTask: HTTPChunkDownloadTaskProtocol {
     func request(for method: String, headers: [String: String]?) async throws -> URLRequest {
         var request = URLRequest(url: task.url)
         request.httpMethod = method
-
+        if let user = task.url.user {
+            let auth = "\(user):\(task.url.password ?? "")".data(using: .utf8)?.base64EncodedString() ?? ""
+            request.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+        }
         for (key, value) in task.taskConfigure.headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
