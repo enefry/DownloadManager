@@ -662,7 +662,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         do {
             // TODO: 检查info文件
 
-            let (_, response) = try await session.data(for: downloadTask.buildRequest(method: "HEAD"))
+            let (_, response) = try await URLSession.shared.data(for: downloadTask.buildRequest(method: "HEAD"))
             try Task.checkCancellation()
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: true)
         } catch is CancellationError {
@@ -676,7 +676,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     // 使用get方式 获取文件长度
     private func checkServerSupportWithGet() async {
         do {
-            let (_, response) = try await session.data(for: downloadTask.buildRequest(headers: ["Range": "bytes=0-1"]))
+            let (_, response) = try await URLSession.shared.data(for: downloadTask.buildRequest(headers: ["Range": "bytes=0-1"]))
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: false)
         } catch {
             await handleServerSupportResponse(response: nil, error: error, isHeadRequest: false)
