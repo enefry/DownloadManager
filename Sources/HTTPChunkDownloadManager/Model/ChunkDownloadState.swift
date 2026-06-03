@@ -49,6 +49,8 @@ public enum ChunkDownloadState: CustomStringConvertible, Codable, Sendable, Hash
     }
 }
 
+public typealias DownloadState = ChunkDownloadState
+
 /// 快速状态判断
 extension ChunkDownloadState {
     /// 检查状态是否表示任务已完成（成功或失败）

@@ -8,6 +8,8 @@ import LoggerProxy
 
 fileprivate let kLogTag = "DM.HD"
 
+public typealias HTTPChunkDownloadManager = HTTPDownloadManager
+
 /// 合并后的下载管理器 Actor
 public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisolated
     private struct ChunkProgress: Sendable, Equatable {
@@ -292,6 +294,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         let downloadTask: any HTTPChunkDownloadTaskProtocol
         let start: Int64
         let end: Int64
+        let usesRangeRequest: Bool
         var downloadedBytes: Int64
         var filePath: URL
         var isCompleted: Bool
@@ -316,15 +319,17 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         private let bufferSize = 64 * 1024 // 64KB 缓冲区
 
         var totalChunkSize: Int64 {
-            end - start + 1
+            guard end >= start else { return -1 }
+            return end - start + 1
         }
 
-        init(identifier: String, index: Int, downloadTask: any HTTPChunkDownloadTaskProtocol, start: Int64, end: Int64, downloadedBytes: Int64, filePath: URL, isCompleted: Bool, task: URLSessionDataTask? = nil) {
+        init(identifier: String, index: Int, downloadTask: any HTTPChunkDownloadTaskProtocol, start: Int64, end: Int64, usesRangeRequest: Bool, downloadedBytes: Int64, filePath: URL, isCompleted: Bool, task: URLSessionDataTask? = nil) {
             self.identifier = identifier
             self.index = index
             self.downloadTask = downloadTask
             self.start = start
             self.end = end
+            self.usesRangeRequest = usesRangeRequest
             self.downloadedBytes = downloadedBytes
             self.filePath = filePath
             self.isCompleted = isCompleted
@@ -344,12 +349,12 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
                 try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
             }
 
-            // 如果文件不存在，创建空文件
-            if !FileManager.default.fileExists(atPath: filePath.path) {
-                _ = FileManager.default.createFile(atPath: filePath.path, contents: nil)
+            var openFlags = O_WRONLY | O_CREAT
+            if !usesRangeRequest && downloadedBytes == 0 {
+                openFlags |= O_TRUNC
             }
 
-            fileDescriptor = open(filePath.path, O_WRONLY)
+            fileDescriptor = open(filePath.path, openFlags, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
             if fileDescriptor == -1 {
                 throw DownloadError.fileIOError("无法打开目标文件:\(filePath.path), errno:\(errno), \(String(cString: strerror(errno)))")
             }
@@ -405,7 +410,8 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
             // 验证响应状态码
             if let httpResponse = response as? HTTPURLResponse {
-                if httpResponse.statusCode == 206 || httpResponse.statusCode == 200 {
+                let validStatusCode = usesRangeRequest ? httpResponse.statusCode == 206 : httpResponse.statusCode == 200
+                if validStatusCode {
                     do {
                         try prepareFileForWriting()
                     } catch {
@@ -427,7 +433,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
 
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-            guard !isCancelled && !isPaused else { return }
+            guard !isCancelled else { return }
 
             LoggerProxy.VLog(tag: kLogTag, msg: "Chunk \(identifier) received \(data.count) bytes")
 
@@ -480,7 +486,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
             // 验证下载完整性
             let expectedSize = totalChunkSize
-            if downloadedBytes >= expectedSize {
+            if expectedSize <= 0 || downloadedBytes == expectedSize {
                 isCompleted = true
                 LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) download completed successfully")
                 sendCompletion(.success(filePath))
@@ -791,6 +797,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
                 downloadTask: downloadTask,
                 start: offset,
                 end: end,
+                usesRangeRequest: true,
                 downloadedBytes: 0,
                 filePath: downloadTask.destinationURL,
                 isCompleted: false
@@ -940,7 +947,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         do {
             // TODO: 检查info文件
 
-            let (_, response) = try await URLSession.shared.data(for: downloadTask.buildRequest(method: "HEAD"))
+            let (_, response) = try await session.data(for: downloadTask.buildRequest(method: "HEAD"))
             try Task.checkCancellation()
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: true)
         } catch is CancellationError {
@@ -954,7 +961,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     // 使用get方式 获取文件长度
     private func checkServerSupportWithGet() async {
         do {
-            let (_, response) = try await URLSession.shared.data(for: downloadTask.buildRequest(headers: ["Range": "bytes=0-1"]))
+            let (_, response) = try await session.data(for: downloadTask.buildRequest(headers: ["Range": "bytes=0-1"]))
             await handleServerSupportResponse(response: response, error: nil, isHeadRequest: false)
         } catch {
             await handleServerSupportResponse(response: nil, error: error, isHeadRequest: false)
@@ -1005,6 +1012,12 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
                 await updateTotalBytes(fileSizeFromRange) // 直接调用，不需要 await
                 await prepareForChunkDownload()
             } else {
+                if totalBytes <= 0,
+                   let contentLength = httpResponse.allHeaderFields["Content-Length"] as? String,
+                   let contentLengthValue = Int64(contentLength),
+                   contentLengthValue > 0 {
+                    await updateTotalBytes(contentLengthValue)
+                }
                 await startNormalDownload()
             }
         }
@@ -1041,7 +1054,8 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         await update(state: .downloading) // 直接调用，不需要 await
         let taskKey = downloadTask.identifier
         /// 普通下载就是一次性的chunk
-        let fullChunk = Chunk(identifier: downloadTask.identifier, index: 0, downloadTask: downloadTask, start: 0, end: -1, downloadedBytes: 0, filePath: downloadTask.destinationURL, isCompleted: false)
+        let expectedEnd = totalBytes > 0 ? totalBytes - 1 : -1
+        let fullChunk = Chunk(identifier: downloadTask.identifier, index: 0, downloadTask: downloadTask, start: 0, end: expectedEnd, usesRangeRequest: false, downloadedBytes: 0, filePath: downloadTask.destinationURL, isCompleted: false)
         let task = Task {
             await downloadChunk(fullChunk)
             self.activeTasks[taskKey] = nil
@@ -1076,7 +1090,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             let startByte = chunkTask.start + chunkTask.downloadedBytes
             let endByte = chunkTask.end
             var headers: [String: String] = [:]
-            if startByte >= 0 || endByte > 0 {
+            if chunkTask.usesRangeRequest {
                 var prefix = ""
                 var suffix = ""
                 if startByte >= 0 {
@@ -1235,6 +1249,10 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             }
         }
         session.invalidateAndCancel()
-        session = URLSession.shared
+        session = URLSession(
+            configuration: downloadTask.urlSessionConfigure,
+            delegate: nil,
+            delegateQueue: nil
+        )
     }
 }

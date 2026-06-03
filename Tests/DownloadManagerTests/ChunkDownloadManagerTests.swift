@@ -1,7 +1,32 @@
 import CryptoKit
+@testable import DownloadManagerBasic
+@testable import HTTPChunkDownloadManager
 @testable import DownloadManager
 import LoggerProxy
 import XCTest
+
+extension DownloadTask: HTTPChunkDownloadTaskProtocol {
+    public var urlSessionConfigure: URLSessionConfiguration {
+        taskConfigure.urlSessionConfigure()
+    }
+
+    public func request(for method: String, headers: [String: String]?) async throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        for (key, value) in taskConfigure.headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        if let headers {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
+        if let timeoutInterval = taskConfigure.timeoutInterval {
+            request.timeoutInterval = timeoutInterval
+        }
+        return request
+    }
+}
 
 final class ChunkDownloadManagerTests: XCTestCase {
     // MARK: - Test Properties
@@ -47,7 +72,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
 
         // Create download manager
         downloadManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: mockConfiguration,
             delegate: mockDelegate
         )
@@ -84,7 +109,6 @@ final class ChunkDownloadManagerTests: XCTestCase {
     private func cleanupFiles() {
         if let destinationURL = mockDownloadTask?.destinationURL {
             try? FileManager.default.removeItem(at: destinationURL)
-            try? FileManager.default.removeItem(at: destinationURL.deletingLastPathComponent())
         }
     }
 
@@ -162,7 +186,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         }
 
         let requestedLength = end - start + 1
-//        let chunkData = data.subdata(in: start ..< (start + requestedLength))
+        let chunkData = data.subdata(in: start ..< (start + requestedLength))
         let ContentRange = "bytes \(start)-\(end)/\(data.count)"
         let uuid = "\(UUID().uuidString)"
         let headers = [
@@ -173,7 +197,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         ]
         print("==>\(headers) <<< \(rangeHeader)")
         return MockURLProtocol.MockResponse(
-            data: data,
+            data: chunkData,
             statusCode: 206,
             headers: headers
         )
@@ -883,7 +907,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         isFirstDownload = false
         mockDelegate = MockHTTPChunkDownloadManagerDelegate()
         downloadManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: mockConfiguration,
             delegate: mockDelegate
         )
@@ -925,7 +949,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         )
 
         let minManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: minConfig,
             delegate: mockDelegate
         )
@@ -939,7 +963,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         )
 
         let maxManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: maxConfig,
             delegate: mockDelegate
         )
@@ -1136,9 +1160,8 @@ final class ChunkDownloadManagerTests: XCTestCase {
             chunkSize: 100,
             maxConcurrentChunks: 8,
         )
-        mockDownloadTask.taskConfigure.timeoutIntervalForRequest = 20
         let smallChunkManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: smallChunkConfig,
             delegate: mockDelegate
         )
@@ -1175,7 +1198,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         )
 
         let largeChunkManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: largeChunkConfig,
             delegate: mockDelegate
         )
@@ -1405,10 +1428,19 @@ final class ChunkDownloadManagerTests: XCTestCase {
             chunkSize: mockConfiguration.chunkSize,
             maxConcurrentChunks: mockConfiguration.maxConcurrentChunks
         )
-        mockDownloadTask.taskConfigure.headers = customHeaders
+        let taskWithHeadersConfiguration = DownloadTaskConfiguration(
+            headers: customHeaders,
+            timeoutIntervalForRequest: downloadTaskConfiguration.timeoutIntervalForRequest,
+            protocolClasses: downloadTaskConfiguration.protocolClasses
+        )
+        let taskWithHeaders = DownloadTask(
+            url: testURL,
+            destinationURL: createUniqueDestinationURL(),
+            configuration: taskWithHeadersConfiguration
+        )
 
         let managerWithHeaders = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: taskWithHeaders,
             configuration: configWithHeaders,
             delegate: mockDelegate
         )
@@ -1478,7 +1510,7 @@ final class ChunkDownloadManagerTests: XCTestCase {
         print("\(#function):\(#line)")
 
         var manager: HTTPChunkDownloadManager? = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: mockConfiguration,
             delegate: mockDelegate
         )
@@ -1700,10 +1732,9 @@ final class ChunkDownloadManagerTests: XCTestCase {
             let progress: Float = param.totalBytes > 0 ? Float(param.downloadedBytes) / Float(param.totalBytes) : 0
             progressHistory.append(progress)
         }
-        mockDownloadTask.taskConfigure.retryStrategy = .none
         mockConfiguration = HTTPChunkDownloadConfiguration(chunkSize: Int64(chunkSize), maxConcurrentChunks: 2)
         downloadManager = HTTPChunkDownloadManager(
-            downloadTask: mockDownloadTask,
+            downloadTask: mockDownloadTask!,
             configuration: mockConfiguration,
             delegate: mockDelegate
         )
@@ -1756,12 +1787,12 @@ private class MockHTTPChunkDownloadManagerDelegate: HTTPChunkDownloadManagerDele
     var onError: ((Error) -> Void)?
     var onCompletion: ((URL) -> Void)?
 
-    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, didCompleteWith task: any HTTPChunkDownloadTaskProtocol) async {
         completionURL = task.destinationURL
         onCompletion?(task.url)
     }
 
-    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: any HTTPChunkDownloadTaskProtocol, didUpdateProgress progress: DownloadProgress) async {
         print("progress=>\(progress.downloadedBytes)/\(progress.totalBytes)")
         if progress.downloadedBytes == -1 && progress.totalBytes == -1 {
             print("异常了～")
@@ -1773,12 +1804,12 @@ private class MockHTTPChunkDownloadManagerDelegate: HTTPChunkDownloadManagerDele
         onProgressDoubleUpdate?(progressRatio)
     }
 
-    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: any HTTPChunkDownloadTaskProtocol, didUpdateState state: DownloadState) async {
         stateUpdates.append(state)
         onStateUpdate?(state)
     }
 
-    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
+    func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: any HTTPChunkDownloadTaskProtocol, didFailWithError error: any Error) async {
         lastError = error
         onError?(error)
     }

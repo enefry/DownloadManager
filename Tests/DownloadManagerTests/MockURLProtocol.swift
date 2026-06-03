@@ -126,10 +126,12 @@ class MockURLProtocol: URLProtocol {
         // 异步处理响应
         Self.queue.async {
             var mockResponse: MockResponse?
+            var handledByRequestHandler = false
 
             // 1. 优先使用动态请求处理器
             if let handler = Self.requestHandler {
                 mockResponse = handler(self.request)
+                handledByRequestHandler = mockResponse != nil
             }
 
             // 2. 检查 Range 请求的特定响应
@@ -155,7 +157,8 @@ class MockURLProtocol: URLProtocol {
             }
 
             // 处理 Range 请求
-            if let rangeHeader = self.request.allHTTPHeaderFields?["Range"]
+            if !handledByRequestHandler,
+               let rangeHeader = self.request.allHTTPHeaderFields?["Range"]
                 , response.data != nil
                 , response.streamChunks {
                 self.handleRangeRequest(mockResponse: response, rangeHeader: rangeHeader, url: url)

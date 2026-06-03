@@ -1,141 +1,9 @@
 import Combine
+@testable import DownloadManagerBasic
+@testable import HTTPChunkDownloadManager
 @testable import DownloadManager // 确保你的模块名正确
 import Foundation
 import XCTest
-
-// MARK: - MockDownloadTask
-
-extension DownloadTask {
-    func setDownloadedBytes(_ bytes: Int64) {
-        downloadedBytes = bytes
-        progressSubject.send(DownloadProgress(downloadedBytes: bytes, totalBytes: totalBytes))
-    }
-
-    func setTotalBytes(_ bytes: Int64) {
-        totalBytes = bytes
-        progressSubject.send(DownloadProgress(downloadedBytes: downloadedBytes, totalBytes: bytes))
-    }
-
-    func setState(_ state: DownloadState) {
-        stateSubject.send(state)
-    }
-}
-
-// MARK: - MockChunkDownloadManager
-
-actor MockChunkDownloadManager: HTTPChunkDownloadManagerProtocol {
-    class DelegateProxy: HTTPChunkDownloadManagerDelegate, @unchecked Sendable {
-        weak var delegate: HTTPChunkDownloadManagerDelegate?
-        weak var mgr: HTTPChunkDownloadManagerProtocol?
-
-        func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, didCompleteWith task: DownloadTask) {
-            if let delegate = delegate, let mgr = mgr {
-                delegate.HTTPChunkDownloadManager(mgr, didCompleteWith: task)
-            }
-        }
-
-        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateProgress progress: DownloadProgress) {
-            if let delegate = delegate, let mgr = mgr {
-                delegate.HTTPChunkDownloadManager(mgr, task: task, didUpdateProgress: progress)
-            }
-        }
-
-        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didUpdateState state: DownloadState) {
-            if let delegate = delegate, let mgr = mgr {
-                delegate.HTTPChunkDownloadManager(mgr, task: task, didUpdateState: state)
-            }
-        }
-
-        nonisolated func HTTPChunkDownloadManager(_ manager: any HTTPChunkDownloadManagerProtocol, task: DownloadTask, didFailWithError error: any Error) {
-            if let delegate = delegate, let mgr = mgr {
-                delegate.HTTPChunkDownloadManager(mgr, task: task, didFailWithError: error)
-            }
-        }
-    }
-
-    var chunkAvailable: Bool
-    var downloadTask: DownloadTask
-    var configuration: HTTPChunkDownloadConfiguration
-    let mgr: HTTPChunkDownloadManager
-    let proxy: DelegateProxy
-    weak var delegate: HTTPChunkDownloadManagerDelegate?
-
-    var startCallCount = 0
-    var pauseCallCount = 0
-    var resumeCallCount = 0
-    var cancelCallCount = 0
-    var cleanupCallCount = 0
-
-    var _state: DownloadState = .initialed
-    var state: DownloadState {
-        get async {
-            _state
-        }
-    }
-
-    init(downloadTask: DownloadTask, configuration: HTTPChunkDownloadConfiguration, delegate: HTTPChunkDownloadManagerDelegate?) {
-        self.downloadTask = downloadTask
-        self.configuration = configuration
-        self.delegate = delegate
-        chunkAvailable = false
-        let proxy = DelegateProxy()
-        self.proxy = proxy
-        mgr = HTTPChunkDownloadManager(downloadTask: downloadTask, configuration: configuration, delegate: proxy)
-
-        proxy.delegate = delegate
-        proxy.mgr = self
-    }
-
-    func start() async {
-        startCallCount += 1
-        _state = .downloading
-        await mgr.start()
-    }
-
-    func pause() async {
-        pauseCallCount += 1
-        _state = .paused
-        await mgr.pause()
-    }
-
-    func resume() async {
-        resumeCallCount += 1
-        _state = .downloading
-        await mgr.resume()
-    }
-
-    func cancel() async {
-        cancelCallCount += 1
-        _state = .cancelled
-        await mgr.cancel()
-    }
-
-    func cleanup() async {
-        cleanupCallCount += 1
-        await mgr.cleanup()
-    }
-
-    func simulateProgress(downloaded: Int64, total: Int64) async {
-        downloadTask.setDownloadedBytes(downloaded)
-        downloadTask.setTotalBytes(total)
-        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateProgress: DownloadProgress(downloadedBytes: downloaded, totalBytes: total))
-    }
-
-    func simulateStateChange(_ state: DownloadState) async {
-        _state = state
-        downloadTask.setState(state)
-        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didUpdateState: state)
-        if state.isFinished {
-            delegate?.HTTPChunkDownloadManager(self, didCompleteWith: downloadTask)
-        }
-    }
-
-    func simulateFailure(_ error: Error) async {
-        _state = .failed(DownloadError.from(error))
-        downloadTask.setState(.failed(DownloadError.from(error)))
-        delegate?.HTTPChunkDownloadManager(self, task: downloadTask, didFailWithError: error)
-    }
-}
 
 // MARK: - MockDownloadPersistenceManager
 
@@ -241,18 +109,19 @@ final class DownloadManagerTests: XCTestCase {
         mockPersistenceManager = MockDownloadPersistenceManager()
         mockNetworkMonitor = MockNetworkMonitor()
 
+        let featureImplements = DownloadManagerConfiguration.FeatureImplements(
+            downloadPersistenceFactory: {
+                self.mockPersistenceManager
+            },
+            networkMonitorFactory: {
+                self.mockNetworkMonitor
+            }
+        )
         let config = DownloadManagerConfiguration(
             maxConcurrentDownloads: 2,
             defaultTaskConfiguration: taskConfigure,
-            chunkDownloadManagerFactory: { downloadTask, configuration, delegate in
-                MockChunkDownloadManager(downloadTask: downloadTask, configuration: configuration, delegate: delegate)
-            },
-            downloadPersistenceFactory: {
-                self.mockPersistenceManager
-            }
-        ) {
-            self.mockNetworkMonitor
-        }
+            featureImplements: featureImplements
+        )
 
         downloadManager = DownloadManager(configuration: config)
         await downloadManager.waitForStartup()

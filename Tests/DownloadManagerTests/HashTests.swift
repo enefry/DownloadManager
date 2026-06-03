@@ -6,6 +6,7 @@
 //
 
 import CryptoKit
+@testable import DownloadManagerBasic
 @testable import DownloadManager
 import LoggerProxy
 import XCTest

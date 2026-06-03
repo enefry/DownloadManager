@@ -27,6 +27,7 @@ let package = Package(
         .package(url: "https://github.com/enefry/LoggerProxy.git", from: "2.0.0"),
         /// 并发队列
         .package(url: "https://github.com/enefry/ConcurrencyCollection.git",from: "0.0.4"),
+        .package(url: "https://github.com/apple/swift-collections.git", exact: "1.1.4"),
         /// 原子类型
         .package(url: "https://github.com/apple/swift-atomics", from: "1.3.0"),
     ],
@@ -84,7 +85,11 @@ let package = Package(
         ),
         .testTarget(
             name: "DownloadManagerTests",
-            dependencies: ["DownloadManager"]
+            dependencies: [
+                "DownloadManager",
+                "DownloadManagerBasic",
+                "HTTPChunkDownloadManager",
+            ]
         )
     ]
 )
