@@ -25,13 +25,14 @@ public struct DownloadManagerView: View {
             TaskListView(model: model.listModel)
         }
         .navigationTitle("下载管理器")
-        .onAppear(perform: {
-            UIApplication.shared.isIdleTimerDisabled = true
-        }).onDisappear(perform: {
-            UIApplication.shared.isIdleTimerDisabled = false
-        })
+
         #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
+            .onAppear(perform: {
+                UIApplication.shared.isIdleTimerDisabled = true
+            }).onDisappear(perform: {
+                UIApplication.shared.isIdleTimerDisabled = false
+            })
+            .navigationBarTitleDisplayMode(.inline)
         #endif
     }
 }

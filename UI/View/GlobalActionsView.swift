@@ -21,7 +21,7 @@ struct GlobalActionsView: View {
     }
 
     var body: some View {
-        HStack {
+        HStack(alignment: .center,spacing: 8) {
             Button(action: model.pauseAll
                 //                        {action = ActionBlock(show: true, type: .pause, title: "暂停所有", message: "暂停所有任务？", action: viewModel.pauseAll)}
                 , label: {

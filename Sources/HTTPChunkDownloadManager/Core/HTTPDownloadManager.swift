@@ -1,7 +1,7 @@
 import Combine
 import ConcurrencyCollection
 import CryptoKit
-import Darwin.C // 引入 C 标准库，包含 open/read/write/close 等函数
+import Darwin.C
 import DownloadManagerBasic
 import Foundation
 import LoggerProxy
@@ -10,17 +10,283 @@ fileprivate let kLogTag = "DM.HD"
 
 /// 合并后的下载管理器 Actor
 public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisolated
-    /// 任务信息
-    private struct TaskInfo: Codable, Sendable, Equatable, Hashable {
-        var src: String
-        var dest: String
-        var identifier: String
-        var chunkAvailable: Bool?
-        var totalBytes: Int64 = 0
+    private struct ChunkProgress: Sendable, Equatable {
+        var downloadedBytes: Int64
+        var isCompleted: Bool
+    }
+
+    private final class ChunkProgressFile: @unchecked Sendable {
+        private static let magic: UInt32 = 0x5044_4348 // HCDP
+        private static let version: UInt16 = 1
+        private static let headerSize = 128
+        private static let slotSize = 64
+        private static let slotsPerChunk = 2
+        private static let completedFlag: UInt32 = 1
+
+        private let fileURL: URL
+        private let totalBytes: Int64
+        private let chunkSize: Int64
+        private let chunkCount: Int
+        private let identifierHash: UInt64
+        private var fd: Int32 = -1
+
+        init(fileURL: URL, totalBytes: Int64, chunkSize: Int64, chunkCount: Int, identifierHash: UInt64) throws {
+            self.fileURL = fileURL
+            self.totalBytes = totalBytes
+            self.chunkSize = chunkSize
+            self.chunkCount = chunkCount
+            self.identifierHash = identifierHash
+
+            let directory = fileURL.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: directory.path) {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+
+            fd = open(fileURL.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+            if fd == -1 {
+                throw Self.fileIOError("无法打开进度文件:\(fileURL.path)")
+            }
+
+            if try !hasValidHeader() {
+                try initializeFile()
+            }
+        }
+
+        deinit {
+            close()
+        }
+
+        func close() {
+            if fd != -1 {
+                Darwin.close(fd)
+                fd = -1
+            }
+        }
+
+        func readProgress(index: Int, chunkLength: Int64) throws -> ChunkProgress {
+            let slotA = try readSlot(index: index, slot: 0, chunkLength: chunkLength)
+            let slotB = try readSlot(index: index, slot: 1, chunkLength: chunkLength)
+
+            switch (slotA, slotB) {
+            case let (.some(a), .some(b)):
+                return a.generation >= b.generation ? a.progress : b.progress
+            case let (.some(a), .none):
+                return a.progress
+            case let (.none, .some(b)):
+                return b.progress
+            case (.none, .none):
+                return ChunkProgress(downloadedBytes: 0, isCompleted: false)
+            }
+        }
+
+        func writeProgress(index: Int, downloadedBytes: Int64, isCompleted: Bool, chunkLength: Int64) throws {
+            let slotA = try readSlot(index: index, slot: 0, chunkLength: chunkLength)
+            let slotB = try readSlot(index: index, slot: 1, chunkLength: chunkLength)
+            let currentSlot: Slot?
+            switch (slotA, slotB) {
+            case let (.some(a), .some(b)):
+                currentSlot = a.generation >= b.generation ? a : b
+            case let (.some(a), .none):
+                currentSlot = a
+            case let (.none, .some(b)):
+                currentSlot = b
+            case (.none, .none):
+                currentSlot = nil
+            }
+
+            if currentSlot?.progress.isCompleted == true {
+                return
+            }
+
+            let currentBytes = currentSlot?.progress.downloadedBytes ?? 0
+            let clampedBytes = min(max(max(downloadedBytes, currentBytes), 0), chunkLength)
+            let completed = isCompleted && clampedBytes == chunkLength
+            let generation = max(slotA?.generation ?? 0, slotB?.generation ?? 0) + 1
+            let targetSlot: Int
+
+            if let a = slotA, let b = slotB {
+                targetSlot = a.generation <= b.generation ? 0 : 1
+            } else if slotA == nil {
+                targetSlot = 0
+            } else {
+                targetSlot = 1
+            }
+
+            let flags = completed ? Self.completedFlag : 0
+            var data = Data()
+            data.reserveCapacity(Self.slotSize)
+            Self.appendUInt64(generation, to: &data)
+            Self.appendInt64(clampedBytes, to: &data)
+            Self.appendUInt64(~UInt64(bitPattern: clampedBytes), to: &data)
+            Self.appendUInt32(flags, to: &data)
+            Self.appendUInt32(~flags, to: &data)
+            Self.pad(&data, to: Self.slotSize)
+
+            try Self.writeAll(fd: fd, data: data, offset: slotOffset(index: index, slot: targetSlot))
+        }
+
+        private struct Slot {
+            var generation: UInt64
+            var progress: ChunkProgress
+        }
+
+        private func hasValidHeader() throws -> Bool {
+            let data = try Self.readUpTo(fd: fd, count: Self.headerSize, offset: 0)
+            guard data.count == Self.headerSize else { return false }
+
+            return Self.readUInt32(data, 0) == Self.magic
+                && Self.readUInt16(data, 4) == Self.version
+                && Int(Self.readUInt16(data, 6)) == Self.headerSize
+                && Int(Self.readUInt16(data, 8)) == Self.slotSize
+                && Int(Self.readUInt16(data, 10)) == Self.slotsPerChunk
+                && Int(Self.readUInt32(data, 12)) == chunkCount
+                && Self.readInt64(data, 24) == totalBytes
+                && Self.readInt64(data, 32) == chunkSize
+                && Self.readUInt64(data, 40) == identifierHash
+        }
+
+        private func initializeFile() throws {
+            let fileSize = Self.headerSize + chunkCount * Self.slotsPerChunk * Self.slotSize
+            if ftruncate(fd, 0) == -1 {
+                throw Self.fileIOError("重置进度文件失败:\(fileURL.path)")
+            }
+            if ftruncate(fd, off_t(fileSize)) == -1 {
+                throw Self.fileIOError("初始化进度文件大小失败:\(fileURL.path)")
+            }
+
+            var header = Data()
+            header.reserveCapacity(Self.headerSize)
+            Self.appendUInt32(Self.magic, to: &header)
+            Self.appendUInt16(Self.version, to: &header)
+            Self.appendUInt16(UInt16(Self.headerSize), to: &header)
+            Self.appendUInt16(UInt16(Self.slotSize), to: &header)
+            Self.appendUInt16(UInt16(Self.slotsPerChunk), to: &header)
+            Self.appendUInt32(UInt32(chunkCount), to: &header)
+            Self.appendUInt32(0, to: &header)
+            Self.appendUInt32(0, to: &header)
+            Self.appendInt64(totalBytes, to: &header)
+            Self.appendInt64(chunkSize, to: &header)
+            Self.appendUInt64(identifierHash, to: &header)
+            Self.pad(&header, to: Self.headerSize)
+            try Self.writeAll(fd: fd, data: header, offset: 0)
+        }
+
+        private func readSlot(index: Int, slot: Int, chunkLength: Int64) throws -> Slot? {
+            let data = try Self.readUpTo(fd: fd, count: Self.slotSize, offset: slotOffset(index: index, slot: slot))
+            guard data.count == Self.slotSize else { return nil }
+
+            let generation = Self.readUInt64(data, 0)
+            let downloadedBytes = Self.readInt64(data, 8)
+            let invertedBytes = Self.readUInt64(data, 16)
+            let flags = Self.readUInt32(data, 24)
+            let invertedFlags = Self.readUInt32(data, 28)
+
+            guard generation > 0 else { return nil }
+            guard invertedBytes == ~UInt64(bitPattern: downloadedBytes) else { return nil }
+            guard invertedFlags == ~flags else { return nil }
+            guard downloadedBytes >= 0, downloadedBytes <= chunkLength else { return nil }
+
+            let isCompleted = (flags & Self.completedFlag) != 0
+            guard !isCompleted || downloadedBytes == chunkLength else { return nil }
+
+            return Slot(generation: generation, progress: ChunkProgress(downloadedBytes: downloadedBytes, isCompleted: isCompleted))
+        }
+
+        private func slotOffset(index: Int, slot: Int) -> Int64 {
+            Int64(Self.headerSize + (index * Self.slotsPerChunk + slot) * Self.slotSize)
+        }
+
+        private static func appendUInt16(_ value: UInt16, to data: inout Data) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        private static func appendUInt32(_ value: UInt32, to data: inout Data) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        private static func appendUInt64(_ value: UInt64, to data: inout Data) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        private static func appendInt64(_ value: Int64, to data: inout Data) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        private static func pad(_ data: inout Data, to size: Int) {
+            if data.count < size {
+                data.append(contentsOf: repeatElement(UInt8(0), count: size - data.count))
+            }
+        }
+
+        private static func readUInt16(_ data: Data, _ offset: Int) -> UInt16 {
+            data.withUnsafeBytes { UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt16.self)) }
+        }
+
+        private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
+            data.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)) }
+        }
+
+        private static func readUInt64(_ data: Data, _ offset: Int) -> UInt64 {
+            data.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)) }
+        }
+
+        private static func readInt64(_ data: Data, _ offset: Int) -> Int64 {
+            data.withUnsafeBytes { Int64(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: Int64.self)) }
+        }
+
+        private static func readUpTo(fd: Int32, count: Int, offset: Int64) throws -> Data {
+            var data = Data(count: count)
+            var totalRead = 0
+            try data.withUnsafeMutableBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return }
+                while totalRead < count {
+                    let bytesRead = pread(fd, baseAddress.advanced(by: totalRead), count - totalRead, off_t(offset + Int64(totalRead)))
+                    if bytesRead == 0 {
+                        break
+                    } else if bytesRead == -1 {
+                        if errno == EINTR {
+                            continue
+                        }
+                        throw fileIOError("读取进度文件失败")
+                    }
+                    totalRead += bytesRead
+                }
+            }
+            data.removeSubrange(totalRead ..< data.count)
+            return data
+        }
+
+        private static func writeAll(fd: Int32, data: Data, offset: Int64) throws {
+            try data.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return }
+                var totalWritten = 0
+                while totalWritten < rawBuffer.count {
+                    let bytesWritten = pwrite(fd, baseAddress.advanced(by: totalWritten), rawBuffer.count - totalWritten, off_t(offset + Int64(totalWritten)))
+                    if bytesWritten == -1 {
+                        if errno == EINTR {
+                            continue
+                        }
+                        throw fileIOError("写入进度文件失败")
+                    }
+                    if bytesWritten == 0 {
+                        throw fileIOError("写入进度文件失败: partial write")
+                    }
+                    totalWritten += bytesWritten
+                }
+            }
+        }
+
+        private static func fileIOError(_ message: String) -> DownloadError {
+            DownloadError.fileIOError("\(message), errno:\(errno), \(String(cString: strerror(errno)))")
+        }
     }
 
     /// 分块任务 - 基于 DataTask 的可控下载方案
-    private class Chunk: NSObject, Sendable, URLSessionDataDelegate {
+    private final class Chunk: NSObject, @unchecked Sendable, URLSessionDataDelegate {
         let identifier: String
         let index: Int
         let downloadTask: any HTTPChunkDownloadTaskProtocol
@@ -32,9 +298,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         var task: URLSessionDataTask?
         var bytesWritten: Int64 = 0
 
-        // 文件句柄用于写入数据
-        private var fileHandle: FileHandle?
-        private var fileOutputStream: OutputStream?
+        private var fileDescriptor: Int32 = -1
 
         // 用于异步等待下载完成
         private var completionLock = NSLock()
@@ -69,7 +333,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
 
         deinit {
-            closeFileHandle()
+            closeFile()
         }
 
         // MARK: - 文件操作
@@ -82,36 +346,56 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
             // 如果文件不存在，创建空文件
             if !FileManager.default.fileExists(atPath: filePath.path) {
-                FileManager.default.createFile(atPath: filePath.path, contents: nil)
+                _ = FileManager.default.createFile(atPath: filePath.path, contents: nil)
             }
 
-            // 打开文件用于写入
-            let fileHandle = try FileHandle(forWritingTo: filePath)
-            if downloadedBytes > 0 { // 如果外面传入需要续传，才续
-                let fileEnd = Int64(try fileHandle.seekToEnd())
-                if fileEnd > downloadedBytes {
-                    try fileHandle.seek(toOffset: UInt64(downloadedBytes))
-                } else if fileEnd < downloadedBytes {
-                    throw DownloadError.fileIOError("Invalid File Length:\(fileEnd) request is \(downloadedBytes) for \(identifier)")
-                }
+            fileDescriptor = open(filePath.path, O_WRONLY)
+            if fileDescriptor == -1 {
+                throw DownloadError.fileIOError("无法打开目标文件:\(filePath.path), errno:\(errno), \(String(cString: strerror(errno)))")
             }
-
-            self.fileHandle = fileHandle
         }
 
         private func writeDataToFile(_ data: Data) throws {
-            guard let fileHandle = fileHandle else {
-                throw DownloadError.fileIOError("File handle not available for \(identifier)")
+            guard fileDescriptor != -1 else {
+                throw DownloadError.fileIOError("File descriptor not available for \(identifier)")
             }
 
-            try fileHandle.write(contentsOf: data)
+            if totalChunkSize > 0, downloadedBytes + Int64(data.count) > totalChunkSize {
+                throw DownloadError.corruptedChunk("Chunk \(identifier) received more bytes than expected")
+            }
+
+            let absoluteOffset = max(0, start) + downloadedBytes
+            try data.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return }
+                var totalWritten = 0
+                while totalWritten < rawBuffer.count {
+                    let bytesWritten = pwrite(
+                        fileDescriptor,
+                        baseAddress.advanced(by: totalWritten),
+                        rawBuffer.count - totalWritten,
+                        off_t(absoluteOffset + Int64(totalWritten))
+                    )
+                    if bytesWritten == -1 {
+                        if errno == EINTR {
+                            continue
+                        }
+                        throw DownloadError.fileIOError("写入目标文件失败:\(identifier), errno:\(errno), \(String(cString: strerror(errno)))")
+                    }
+                    if bytesWritten == 0 {
+                        throw DownloadError.fileIOError("写入目标文件失败:\(identifier), partial write")
+                    }
+                    totalWritten += bytesWritten
+                }
+            }
             bytesWritten += Int64(data.count)
             downloadedBytes += Int64(data.count)
         }
 
-        private func closeFileHandle() {
-            try? fileHandle?.close()
-            fileHandle = nil
+        private func closeFile() {
+            if fileDescriptor != -1 {
+                Darwin.close(fileDescriptor)
+                fileDescriptor = -1
+            }
         }
 
         // MARK: - URLSessionDataDelegate
@@ -169,7 +453,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             defer {
-                closeFileHandle()
+                closeFile()
             }
 
             if let error = error {
@@ -271,7 +555,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         func cancelDownload() {
             isCancelled = true
             task?.cancel()
-            closeFileHandle()
+            closeFile()
             sendCompletion(.failure(CancellationError()))
             LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) cancelled")
         }
@@ -282,11 +566,6 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             downloadedBytes = 0
             bytesWritten = 0
             isCompleted = false
-
-            // 删除已下载的文件
-            if FileManager.default.fileExists(atPath: filePath.path) {
-                try FileManager.default.removeItem(at: filePath)
-            }
 
             LoggerProxy.DLog(tag: kLogTag, msg: "Chunk \(identifier) reset")
         }
@@ -303,49 +582,9 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
     }
 
-//    /// 分块任务
-//    private class Chunk: NSObject, Sendable, URLSessionDownloadDelegate {
-//        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-//            finishLocation = location
-//        }
-//
-//        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-//            progress = DownloadProgress(downloadedBytes: bytesWritten, totalBytes: totalBytesWritten)
-//        }
-//
-//        let identifier: String
-//        let index: Int
-//        let downloadTask: any HTTPChunkDownloadTaskProtocol
-//        let start: Int64
-//        let end: Int64
-//        var downloadedBytes: Int64
-//        var filePath: URL
-//        var isCompleted: Bool
-//        var task: URLSessionDownloadTask?
-//        var bytesWritten: Int64 = 0
-//        @Published var finishLocation: URL?
-//        @Published var progress: DownloadProgress = DownloadProgress(downloadedBytes: 0, totalBytes: 0)
-//
-//        var totalChunkSize: Int64 {
-//            end - start + 1
-//        }
-//
-//        init(identifier: String, index: Int, downloadTask: any HTTPChunkDownloadTaskProtocol, start: Int64, end: Int64, downloadedBytes: Int64, filePath: URL, isCompleted: Bool, task: URLSessionDownloadTask? = nil) {
-//            self.identifier = identifier
-//            self.index = index
-//            self.downloadTask = downloadTask
-//            self.start = start
-//            self.end = end
-//            self.downloadedBytes = downloadedBytes
-//            self.filePath = filePath
-//            self.isCompleted = isCompleted
-//            self.task = task
-//        }
-//    }
-
-    /// 当前下载任务的信息，用于记录内部状态
-    private var taskInfoSavePath: URL
-    private var taskInfo: TaskInfo
+    /// 固定格式进度文件，用于记录每个分片的断点位置
+    private var progressFilePath: URL
+    private var progressFile: ChunkProgressFile?
     /// 下载任务
     private let downloadTask: any HTTPChunkDownloadTaskProtocol
     /// 分块配置
@@ -402,18 +641,10 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
             delegate: nil,
             delegateQueue: nil
         )
-        taskInfo = TaskInfo(src: downloadTask.url.absoluteURL.absoluteString, dest: downloadTask.destinationURL.absoluteURL.absoluteString, identifier: downloadTask.identifier)
         tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("HTTPChunkDownloadManager")
-            .appendingPathComponent("\(taskInfo.identifier).downloading")
-        taskInfoSavePath = tempDirectory.appendingPathComponent("info.json")
-        if FileManager.default.fileExists(atPath: taskInfoSavePath.path) {
-            do {
-                taskInfo = try JSONDecoder().decode(TaskInfo.self, from: Data(contentsOf: taskInfoSavePath))
-            } catch {
-                LoggerProxy.WLog(tag: kLogTag, msg: "恢复任务信息失败")
-            }
-        }
+            .appendingPathComponent("\(downloadTask.identifier).downloading")
+        progressFilePath = tempDirectory.appendingPathComponent("progress.dat")
         LoggerProxy.DLog(tag: kLogTag, msg: "init:\(self)")
     }
 
@@ -487,6 +718,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     /// 取消的任务不会删除临时目录，需要手动删除
     public func cleanup() {
         do {
+            closeProgressFile()
             if FileManager.default.fileExists(atPath: tempDirectory.path) {
                 try FileManager.default.removeItem(at: tempDirectory)
             }
@@ -495,8 +727,9 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
     }
 
-    private func saveTaskInfo() throws {
-        try JSONEncoder().encode(taskInfo).write(to: taskInfoSavePath)
+    private func closeProgressFile() {
+        progressFile?.close()
+        progressFile = nil
     }
 
     /// 创建临时文件夹
@@ -504,14 +737,46 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         if !FileManager.default.fileExists(atPath: tempDirectory.path) {
             try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         }
-        /// 创建分块是否，已经知道长度，这时候可以保存info信息
-        taskInfo.totalBytes = totalBytes
-        try? saveTaskInfo()
         LoggerProxy.DLog(tag: kLogTag, msg: "createTempDirectory:\(tempDirectory)")
     }
 
+    /// 创建目标稀疏文件。APFS/HFS+ 上 ftruncate 扩展文件不会为未写入区间分配真实数据块。
+    private func prepareSparseDestinationFile() throws {
+        let destinationDirectory = downloadTask.destinationURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: destinationDirectory.path) {
+            try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        }
+
+        if !FileManager.default.fileExists(atPath: downloadTask.destinationURL.path) {
+            _ = FileManager.default.createFile(atPath: downloadTask.destinationURL.path, contents: nil)
+        }
+
+        let fileHandle = try FileHandle(forWritingTo: downloadTask.destinationURL)
+        defer { try? fileHandle.close() }
+        try fileHandle.truncate(atOffset: UInt64(totalBytes))
+    }
+
+    private func prepareProgressFile() throws {
+        closeProgressFile()
+        progressFile = try ChunkProgressFile(
+            fileURL: progressFilePath,
+            totalBytes: totalBytes,
+            chunkSize: configuration.chunkSize,
+            chunkCount: chunkTasks.count,
+            identifierHash: progressIdentifierHash()
+        )
+    }
+
+    private func progressIdentifierHash() -> UInt64 {
+        let key = "\(downloadTask.url.absoluteString)\n\(downloadTask.destinationURL.absoluteString)\n\(downloadTask.identifier)"
+        let digest = SHA256.hash(data: Data(key.utf8))
+        return digest.withUnsafeBytes {
+            UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self))
+        }
+    }
+
     /// 创建分块任务
-    private func createChunkTasks() async {
+    private func createChunkTasks() {
         guard totalBytes > 0 else { return }
 
         var offset: Int64 = 0
@@ -527,7 +792,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
                 start: offset,
                 end: end,
                 downloadedBytes: 0,
-                filePath: tempDirectory.appendingPathComponent("[\(index)]\(offset)-\(chunkSize).part"),
+                filePath: downloadTask.destinationURL,
                 isCompleted: false
             )
             tempChunkTasks.append(chunkTask)
@@ -536,36 +801,25 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
 
         chunkTasks = tempChunkTasks
-        await checkLocalChunksStatus()
     }
 
     /// 检查本地分块
     private func checkLocalChunksStatus() async {
         var totalDownloaded: Int64 = 0
+        let destinationExists = FileManager.default.fileExists(atPath: downloadTask.destinationURL.path)
 
         for i in 0 ..< chunkTasks.count {
             let chunkTask = chunkTasks[i]
-            let chunkPath = chunkTask.filePath.path
-            if FileManager.default.fileExists(atPath: chunkPath) {
-                do {
-                    let attributes = try FileManager.default.attributesOfItem(atPath: chunkPath)
-                    let fileSize = attributes[.size] as? Int64 ?? 0
-                    if fileSize == chunkTasks[i].totalChunkSize {
-                        chunkTasks[i].isCompleted = true
-                        chunkTasks[i].downloadedBytes = fileSize
-                        taskDownloadedBytes[chunkTask.identifier] = fileSize
-                    } else if fileSize > 0 {
-                        chunkTasks[i].downloadedBytes = fileSize
-                        taskDownloadedBytes[chunkTask.identifier] = fileSize
-                    } else {
-                        try? FileManager.default.removeItem(atPath: chunkPath)
-                        chunkTasks[i].downloadedBytes = 0
-                        taskDownloadedBytes[chunkTask.identifier] = 0
-                    }
-                } catch {
-                    try? FileManager.default.removeItem(atPath: chunkPath)
-                    chunkTasks[i].downloadedBytes = 0
-                }
+            if destinationExists,
+               let progressFile = progressFile,
+               let progress = try? progressFile.readProgress(index: chunkTask.index, chunkLength: chunkTask.totalChunkSize) {
+                chunkTasks[i].downloadedBytes = progress.downloadedBytes
+                chunkTasks[i].isCompleted = progress.isCompleted
+                taskDownloadedBytes[chunkTask.identifier] = progress.downloadedBytes
+            } else {
+                chunkTasks[i].downloadedBytes = 0
+                chunkTasks[i].isCompleted = false
+                taskDownloadedBytes[chunkTask.identifier] = 0
             }
             totalDownloaded += chunkTasks[i].downloadedBytes
         }
@@ -584,8 +838,15 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
     }
 
     /// 更新分块进度
-    private func updateDownloadProgress(for identifier: String, bytes: Int64) async {
-        taskDownloadedBytes[identifier] = bytes
+    private func updateDownloadProgress(for chunk: Chunk, bytes: Int64) async {
+        guard chunkTasks.indices.contains(chunk.index) else { return }
+        let currentChunk = chunkTasks[chunk.index]
+        guard !currentChunk.isCompleted else { return }
+
+        let currentBytes = taskDownloadedBytes[chunk.identifier] ?? currentChunk.downloadedBytes
+        let nextBytes = max(currentBytes, bytes)
+        taskDownloadedBytes[chunk.identifier] = nextBytes
+        writeProgress(for: chunk.index, downloadedBytes: nextBytes, isCompleted: false)
         await updateProgressIfNeeded()
     }
 
@@ -605,6 +866,23 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         guard chunkTasks.indices.contains(index) else { return }
         chunkTasks[index].isCompleted = completed
         chunkTasks[index].downloadedBytes = downloadedBytes
+        taskDownloadedBytes[chunkTasks[index].identifier] = downloadedBytes
+        writeProgress(for: index, downloadedBytes: downloadedBytes, isCompleted: completed)
+    }
+
+    private func writeProgress(for index: Int, downloadedBytes: Int64, isCompleted: Bool) {
+        guard chunkTasks.indices.contains(index), let progressFile = progressFile else { return }
+        let chunk = chunkTasks[index]
+        do {
+            try progressFile.writeProgress(
+                index: index,
+                downloadedBytes: downloadedBytes,
+                isCompleted: isCompleted,
+                chunkLength: chunk.totalChunkSize
+            )
+        } catch {
+            LoggerProxy.WLog(tag: kLogTag, msg: "写入分片进度失败: \(error)")
+        }
     }
 
     private func getNextAvailableChunks(maxCount: Int) -> [Chunk] {
@@ -685,7 +963,7 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
     /// 获取到文件长度后到操作
     private func handleServerSupportResponse(response: URLResponse?, error: Error?, isHeadRequest: Bool) async {
-        LoggerProxy.DLog(tag: kLogTag, msg: "\(Date()):handleServerSupportResponse:\(downloadTask.identifier), resp=\(response),error=\(error)")
+        LoggerProxy.DLog(tag: kLogTag, msg: "\(Date()):handleServerSupportResponse:\(downloadTask.identifier), resp=\(String(describing: response)),error=\(String(describing: error))")
 
         if let error = error {
             await handleDownloadFailure(error: DownloadError.networkError(error.localizedDescription))
@@ -742,7 +1020,10 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         do {
             chunkAvailable = true
             try createTempDirectory() // 直接调用，不需要 await
-            await createChunkTasks() // 直接调用，不需要 await
+            try prepareSparseDestinationFile()
+            createChunkTasks()
+            try prepareProgressFile()
+            await checkLocalChunksStatus()
             await update(state: .downloading) // 直接调用，不需要 await
             await checkAndStartAvailableChunksDownload()
         } catch {
@@ -758,19 +1039,14 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
 
     private func startNormalDownload() async {
         await update(state: .downloading) // 直接调用，不需要 await
-        do {
-            let request = try await downloadTask.buildRequest()
-            let taskKey = downloadTask.identifier
-            /// 普通下载就是一次性的chunk
-            let fullChunk = Chunk(identifier: downloadTask.identifier, index: 0, downloadTask: downloadTask, start: 0, end: -1, downloadedBytes: 0, filePath: downloadTask.destinationURL, isCompleted: false)
-            let task = Task {
-                await downloadChunk(fullChunk)
-                self.activeTasks[taskKey] = nil
-            }
-            activeTasks[taskKey] = task
-        } catch {
-            await handleDownloadFailure(error: error)
+        let taskKey = downloadTask.identifier
+        /// 普通下载就是一次性的chunk
+        let fullChunk = Chunk(identifier: downloadTask.identifier, index: 0, downloadTask: downloadTask, start: 0, end: -1, downloadedBytes: 0, filePath: downloadTask.destinationURL, isCompleted: false)
+        let task = Task {
+            await downloadChunk(fullChunk)
+            self.activeTasks[taskKey] = nil
         }
+        activeTasks[taskKey] = task
     }
 
     private func checkAndStartAvailableChunksDownload() async {
@@ -785,201 +1061,13 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         if chunksToStart.isEmpty {
             let allCompleted = chunkTasks.allSatisfy { $0.isCompleted }
             if allCompleted {
-                await mergeChunks()
+                await finishChunkDownload()
             }
         } else {
             for chunk in chunksToStart {
                 await downloadChunk(chunk)
             }
         }
-    }
-
-    private func waitForResumeOrCancel() async throws {
-        let subject = $state.filter({ $0 != .paused }).eraseToAnyPublisher()
-        while state == .paused { // 直接调用，不需要 await
-            for await _ in subject.values {
-                break
-            }
-            LoggerProxy.ILog(tag: kLogTag, msg: "暂停中恢复:\(state)")
-            if state == .cancelled { // 直接调用，不需要 await
-                throw DownloadError.cancelled
-            }
-            try Task.checkCancellation()
-        }
-    }
-
-//    func optimizedDownload(bytes: URLSession.AsyncBytes, fileHandle: FileHandle, identifier: String, totalDownloaded: inout Int64) async throws {
-//        var buffer = Data()
-//        buffer.reserveCapacity(configuration.bufferSize)
-//
-//        let chunkSize = min(8192, configuration.bufferSize) // 8KB 块大小
-//        var tempChunk = Data()
-//        tempChunk.reserveCapacity(chunkSize)
-//
-//        var processedBytes = 0
-//        let statusCheckInterval = configuration.bufferSize // 每个缓冲区大小检查一次状态
-//
-//        for try await byte in bytes {
-//            tempChunk.append(byte)
-//            processedBytes += 1
-//
-//            // 当临时块达到大小或者需要检查状态时
-//            if tempChunk.count >= chunkSize || processedBytes % statusCheckInterval == 0 {
-//                // 状态检查
-//                try Task.checkCancellation()
-//
-//                if state == .cancelled {
-//                    throw DownloadError.cancelled
-//                }
-//
-//                // 添加到主缓冲区
-//                buffer.append(tempChunk)
-//                tempChunk.removeAll(keepingCapacity: true)
-//
-//                // 写入文件如果缓冲区满了
-//                if buffer.count >= configuration.bufferSize {
-//                    try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-//                    totalDownloaded += Int64(buffer.count)
-//                    buffer.removeAll(keepingCapacity: true)
-//                }
-//
-//                // 处理暂停
-//                if state == .paused {
-//                    if !buffer.isEmpty {
-//                        try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-//                        totalDownloaded += Int64(buffer.count)
-//                        buffer.removeAll(keepingCapacity: true)
-//                    }
-//                    try await waitForResumeOrCancel()
-//                }
-//            }
-//        }
-//
-//        // 处理剩余数据
-//        if !tempChunk.isEmpty {
-//            buffer.append(tempChunk)
-//        }
-//
-//        if !buffer.isEmpty {
-//            try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-//            totalDownloaded += Int64(buffer.count)
-//        }
-//    }
-
-//    /// 普通下载，就是一次性下载全部
-//    private func downloadNormalAsync(request: URLRequest) async {
-//
-//    }
-//        LoggerProxy.DLog(tag: kLogTag, msg: "start downloadNormalAsync")
-//        let identifier = downloadTask.identifier
-//        let tempFile = downloadTask.destinationURL.appendingPathExtension(".downloading")
-//        do {
-//            let (bytes, response) = try await session.bytes(for: request)
-//            try Task.checkCancellation()
-//
-//            guard let httpResponse = response as? HTTPURLResponse,
-//                  httpResponse.statusCode == 200 else {
-//                throw DownloadError.invalidResponse
-//            }
-//
-//            let contentLength = httpResponse.allHeaderFields["Content-Length"] as? String
-//            let expectedTotalBytes = contentLength.flatMap { Int64($0) } ?? -1
-//            await updateTotalBytes(expectedTotalBytes) // 直接调用，不需要 await
-//
-//            let destinationDirectory = downloadTask.destinationURL.deletingLastPathComponent()
-//            try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-//            try? FileManager.default.removeItem(at: downloadTask.destinationURL)
-//            FileManager.default.createFile(atPath: downloadTask.destinationURL.path, contents: nil)
-//
-//            let fileHandle = try FileHandle(forWritingTo: tempFile)
-//            defer {
-//                try? fileHandle.close()
-//            }
-//            var totalDownloaded: Int64 = 0
-//            var buffer = Data()
-//            try await optimizedDownload(bytes: bytes, fileHandle: fileHandle, identifier: identifier, totalDownloaded: &totalDownloaded)
-    ////            for try await byte in bytes {
-    ////                buffer.append(byte)
-    ////
-    ////                try Task.checkCancellation()
-    ////
-    ////                if state == .cancelled {
-    ////                    throw DownloadError.cancelled
-    ////                }
-    ////
-    ////                buffer.append(byte)
-    ////
-    ////                if buffer.count >= configuration.bufferSize {
-    ////                    try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                    totalDownloaded += Int64(buffer.count)
-    ////                    buffer.removeAll(keepingCapacity: true)
-    ////                }
-    ////
-    ////                if state == .paused {
-    ////                    if !buffer.isEmpty {
-    ////                        try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                        totalDownloaded += Int64(buffer.count)
-    ////                        buffer.removeAll(keepingCapacity: true)
-    ////                    }
-    ////                    try await waitForResumeOrCancel()
-    ////                }
-    ////            }
-//
-    ////            if !buffer.isEmpty {
-    ////                try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                totalDownloaded += Int64(buffer.count)
-    ////                buffer.removeAll()
-    ////            }
-//
-//            LoggerProxy.DLog(tag: kLogTag, msg: "close file handler for normal download")
-//
-//            if expectedTotalBytes > 0, /// 已经有文件长度的前提
-//               totalDownloaded != expectedTotalBytes {
-//                throw DownloadError.corruptedChunk(identifier)
-//            }
-//            // 下载完成才重命名回去
-//            try FileManager.default.moveItem(at: tempFile, to: downloadTask.destinationURL)
-//            await handleDownloadCompletion()
-//        } catch {
-//            if FileManager.default.fileExists(atPath: tempFile.path) {
-//                try? FileManager.default.removeItem(at: tempFile)
-//            }
-//            await handleNormalDownloadError(error)
-//        }
-//    }
-
-//    private func writeBufferToFile(buffer: Data, fileHandle: FileHandle, identifier: String) async throws {
-//        let deltaSize = Int64(buffer.count)
-//        try fileHandle.write(contentsOf: buffer)
-//        await updateDownloadProgress(for: identifier, bytes: deltaSize)
-//        LoggerProxy.VLog(tag: kLogTag, msg: "write to file handler for download with: offset=\(progress.0) +  \(deltaSize)=\(progress.1) \(identifier)")
-//    }
-
-    private func handleNormalDownloadError(_ error: Error) async {
-        let chunkError: DownloadError
-        if let ce = error as? DownloadError {
-            chunkError = ce
-        } else {
-            chunkError = DownloadError.from(error)
-        }
-
-        if case .cancelled = chunkError {
-            return
-        } else {
-            await handleDownloadFailure(error: chunkError)
-        }
-    }
-
-    private func openFileHandler(for chunkTask: Chunk) throws -> FileHandle {
-        let fileHandle: FileHandle
-        if chunkTask.downloadedBytes > 0 {
-            fileHandle = try FileHandle(forWritingTo: chunkTask.filePath)
-            try fileHandle.seekToEnd()
-        } else {
-            FileManager.default.createFile(atPath: chunkTask.filePath.path, contents: nil)
-            fileHandle = try FileHandle(forWritingTo: chunkTask.filePath)
-        }
-        return fileHandle
     }
 
     private func downloadChunk(_ chunkTask: Chunk) async {
@@ -1011,129 +1099,41 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
     }
 
-//    @concurrent
-//    private func downloadChunkAsync(request: URLRequest, chunk: Chunk) async {
-//        LoggerProxy.DLog(tag: kLogTag, msg: "start downloadChunkAsync--->:\(chunk.identifier)")
-    ////        var taskFileHandle: FileHandle?
-//        var downloadedBytes: Int64 = chunk.downloadedBytes
-//        let identifier = chunk.identifier
-//        do {
-//            if await state == .cancelled {
-//                return
-//            }
-//
-//            let (bytes, response) = try await session.bytes(for: request)
-//            try Task.checkCancellation()
-//
-//            guard let httpResponse = response as? HTTPURLResponse,
-//                  httpResponse.statusCode == 206 || httpResponse.statusCode == 200 else {
-//                throw DownloadError.invalidResponse
-//            }
-//
-//            let fileHandle = try await openFileHandler(for: chunk)
-//            defer {
-//                try? fileHandle.close()
-//            }
-//
-//            // 初始化任务下载字节数
-    ////            await updateDownloadProgress(for: identifier, addedBytes: chunk.downloadedBytes) // 直接调用，不需要 await
-//            try await optimizedDownload(bytes: bytes, fileHandle: fileHandle, identifier: identifier, totalDownloaded: &downloadedBytes)
-    ////            var buffer = Data()
-    ////            for try await byte in bytes {
-    ////                try Task.checkCancellation()
-    ////
-    ////                if await state == .cancelled {
-    ////                    throw DownloadError.cancelled
-    ////                }
-    ////                /// 其他下载失败
-    ////                if await state.isFailed {
-    ////                    // 直接不玩了……
-    ////                    LoggerProxy.DLog(tag: kLogTag, msg: "有其他chunk下载失败，直接取消下载任务")
-    ////                    return
-    ////                }
-    ////
-    ////                buffer.append(byte)
-    ////                if await state == .paused {
-    ////                    if !buffer.isEmpty {
-    ////                        try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                        downloadedBytes += Int64(buffer.count)
-    ////                        buffer.removeAll(keepingCapacity: true)
-    ////                    }
-    ////
-    ////                    try await waitForResumeOrCancel()
-    ////                }
-    ////                if buffer.count >= configuration.bufferSize { // 64k 一次保存
-    ////                    try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                    downloadedBytes += Int64(buffer.count)
-    ////                    buffer.removeAll(keepingCapacity: true)
-    ////                }
-    ////            }
-    ////
-    ////            // 写入剩余缓冲区数据
-    ////            if !buffer.isEmpty {
-    ////                try await writeBufferToFile(buffer: buffer, fileHandle: fileHandle, identifier: identifier)
-    ////                downloadedBytes += Int64(buffer.count)
-    ////                buffer.removeAll()
-    ////            }
-//
-//            // 验证下载的字节数
-//            let expectedBytes = chunk.totalChunkSize
-//            if downloadedBytes != expectedBytes {
-//                LoggerProxy.DLog(tag: kLogTag, msg: "验证下载结果失败:\(downloadedBytes)!=\(expectedBytes) , \(request.allHTTPHeaderFields),response=>\(response)")
-//                throw DownloadError.corruptedChunk(chunk.identifier)
-//            }
-//
-//            LoggerProxy.DLog(tag: kLogTag, msg: "close file handler:\(identifier)")
-//
-//            // 更新分片状态并处理完成
-//            await updateChunkStatus(at: chunk.index, completed: true, downloadedBytes: downloadedBytes) // 直接调用，不需要 await
-//            await onChunkComplete(for: chunk)
-//        } catch {
-//            await handleChunkError(error, for: chunk)
-//        }
-//    }
     /// 使用 DownloadTask 方式下载分块
     private func downloadChunkAsync(request: URLRequest, chunk: Chunk) async {
         LoggerProxy.DLog(tag: kLogTag, msg: "start downloadChunkWithDownloadTask--->:\(chunk.identifier)")
 
         do {
-            if await state == .cancelled {
+            if state == .cancelled {
                 return
             }
 
             // 设置进度回调
             chunk.onProgressUpdate = { [weak self] chunk, downloaded, _ in
                 Task {
-                    await self?.updateDownloadProgress(for: chunk.identifier, bytes: downloaded)
+                    await self?.updateDownloadProgress(for: chunk, bytes: downloaded)
                 }
             }
             // 开始下载并等待完成
-            try await chunk.startDownload(with: session, request: request)
+            _ = try await chunk.startDownload(with: session, request: request)
 
-            // 验证下载的文件大小
-            let downloadedFileSize = try FileManager.default.attributesOfItem(atPath: chunk.filePath.path)[.size] as? Int64 ?? 0
             let expectedBytes = chunk.totalChunkSize
 
-            if downloadedFileSize != expectedBytes {
-                LoggerProxy.DLog(tag: kLogTag, msg: "验证下载结果失败:\(downloadedFileSize)!=\(expectedBytes) , \(request.allHTTPHeaderFields)")
+            if expectedBytes > 0, chunk.downloadedBytes != expectedBytes {
+                LoggerProxy.DLog(tag: kLogTag, msg: "验证下载结果失败:\(chunk.downloadedBytes)!=\(expectedBytes) , \(String(describing: request.allHTTPHeaderFields))")
                 throw DownloadError.corruptedChunk(chunk.identifier)
             }
-
-            // 将下载的临时文件移动到目标位置
-//            try await moveChunkToFinalLocation(from: tempLocation, chunk: chunk)
 
             LoggerProxy.DLog(tag: kLogTag, msg: "Chunk download completed: \(chunk.identifier)")
 
             // 更新分块状态
-            await updateChunkStatus(at: chunk.index, completed: true, downloadedBytes: downloadedFileSize)
+            updateChunkStatus(at: chunk.index, completed: true, downloadedBytes: chunk.downloadedBytes)
             await onChunkComplete(for: chunk)
         } catch {
             LoggerProxy.DLog(tag: kLogTag, msg: "Chunk download failed: \(chunk.identifier), error: \(error)")
             await handleChunkError(error, for: chunk)
         }
     }
-
-    /// 将分块文件移动到最终位置
 
     private func onChunkComplete(for chunk: Chunk) async {
         let allCompleted = markChunkComplete(for: chunk.identifier) // 直接调用，不需要 await
@@ -1142,15 +1142,15 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         guard state == .downloading || state == .preparing else { return }
 
         if allCompleted {
-            await mergeChunks()
+            await finishChunkDownload()
         } else {
             await checkAndStartAvailableChunksDownload()
         }
     }
 
-    private func mergeChunks() async {
+    private func finishChunkDownload() async {
         do {
-            try await mergeChunksToFile()
+            try finalizeSparseDestinationFile()
             cleanup() // 直接调用，不需要 await
             await handleDownloadCompletion()
         } catch {
@@ -1164,183 +1164,24 @@ public actor HTTPDownloadManager: HTTPChunkDownloadManagerProtocol { /// nonisol
         }
     }
 
-    private func mergeChunksToFile() async throws {
-        await update(state: .merging) // 直接调用，不需要 await
-
-        let tempMergeFile = tempDirectory.appendingPathComponent("final_merged_file.tmp")
-        let chunkFiles = chunkTasks.sorted(by: { $0.start < $1.start }).map({ $0.filePath.path })
-
-        // 使用 256k~4m 块，进行文件合并
-        let bufferSize = Int(min(max(configuration.chunkSize, 256 * 1024), 4 * 1024 * 1024)) // 256~1m
-
-        /// 删除
-        if FileManager.default.fileExists(atPath: tempMergeFile.path) {
-            try FileManager.default.removeItem(at: tempMergeFile)
+    private func finalizeSparseDestinationFile() throws {
+        guard FileManager.default.fileExists(atPath: downloadTask.destinationURL.path) else {
+            throw DownloadError.fileSystemError("目标文件不存在:\(downloadTask.destinationURL.path)")
         }
-        let dir = downloadTask.destinationURL.deletingLastPathComponent()
 
-        if !FileManager.default.fileExists(atPath: downloadTask.destinationURL.deletingLastPathComponent().path) {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-        try checkDiskSpace(requiredSpace: totalBytes, destinationURL: dir)
-
-        // 校验分块文件大小是否都是预期的
         for chunkTask in chunkTasks {
             try validateChunk(chunkTask)
         }
 
-        // 使用 open方式合并，更加高效
-        try mergeFilesWithPOSIXOpen(sourceFilePaths: chunkFiles, destinationFilePath: tempMergeFile.path, bufferSize: bufferSize)
-
-//        // 创建合并文件
-//        FileManager.default.createFile(atPath: tempMergeFile.path, contents: nil)
-//        let fileHandle = try FileHandle(forWritingTo: tempMergeFile)
-//        defer { try? fileHandle.close() }
-//
-//        /// 按照开始顺序，写入
-//        for chunkTask in chunkTasks.sorted(by: { $0.start < $1.start }) {
-//            let chunkHandle = try FileHandle(forReadingFrom: chunkTask.filePath)
-//            defer { try? chunkHandle.close() }
-//
-//            try autoreleasepool {
-//                while let data = try chunkHandle.read(upToCount: bufferSize) {
-//                    try fileHandle.write(contentsOf: data)
-//                }
-//            }
-//        }
-
-        let destinationDirectory = downloadTask.destinationURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-        // 如果目标文件存在，删除并重命名
-        LoggerProxy.DLog(tag: kLogTag, msg: "merge move from:\(tempMergeFile) to:\(downloadTask.destinationURL)")
-        if FileManager.default.fileExists(atPath: downloadTask.destinationURL.path) {
-            try FileManager.default.removeItem(at: downloadTask.destinationURL)
-        }
-        try FileManager.default.moveItem(at: tempMergeFile, to: downloadTask.destinationURL)
-    }
-
-    // 定义一个错误枚举，以便更清晰地表示可能发生的错误
-    enum POSIXFileMergeError: Error {
-        case cannotOpenFile(String, Int32) // 文件路径, errno
-        case cannotCreateFile(String, Int32)
-        case readError(String, Int32)
-        case writeError(String, Int32)
-        case partialWriteError(String, Int, Int) // 文件路径, 期望写入字节数, 实际写入字节数
-    }
-
-    /// 使用 POSIX open/read/write 接口高效合并多个文件。
-    /// - Parameters:
-    ///   - sourceFilePaths: 包含所有源文件路径的数组。
-    ///   - destinationFilePath: 合并后的目标文件路径。
-    ///   - bufferSize: 用于读写操作的缓冲区大小（字节）。默认为 64KB。
-    /// - Throws: 如果文件操作失败，则抛出 POSIXFileMergeError。
-    func mergeFilesWithPOSIXOpen(sourceFilePaths: [String], destinationFilePath: String, bufferSize: Int = 64 * 1024) throws {
-        let fileManager = FileManager.default
-
-        // 1. 确保目标文件不存在，如果存在则删除
-        if fileManager.fileExists(atPath: destinationFilePath) {
-            do {
-                try fileManager.removeItem(atPath: destinationFilePath)
-            } catch {
-                LoggerProxy.ELog(tag: kLogTag, msg: "警告: 无法删除现有目标文件 \(destinationFilePath): \(error.localizedDescription)")
-                // 可以选择在这里抛出错误，或继续尝试写入（这会覆盖文件）
-            }
-        }
-
-        // 2. 打开或创建目标文件以便写入
-        // O_WRONLY: 只写模式
-        // O_CREAT: 如果文件不存在则创建
-        // O_TRUNC: 如果文件存在则清空其内容
-        // S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH: 设置文件权限 (用户读写，组和其他只读)
-        let destFD = open(destinationFilePath, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
-        if destFD == -1 {
-            throw POSIXFileMergeError.cannotCreateFile(destinationFilePath, errno)
-        }
-
-        // 确保在函数退出时关闭目标文件描述符
-        defer {
-            close(destFD)
-        }
-
-        // 3. 分配一个预分配的缓冲区
-        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bufferSize, alignment: MemoryLayout<UInt8>.alignment)
-        // 确保在函数退出时释放这块内存
-        defer {
-            buffer.deallocate()
-        }
-
-        // 4. 遍历源文件并逐一合并
-        for sourcePath in sourceFilePaths {
-            LoggerProxy.DLog(tag: kLogTag, msg: "正在合并文件: \(sourcePath)")
-
-            // 打开源文件进行读取
-            let sourceFD = open(sourcePath, O_RDONLY)
-            let errcode = errno
-            if sourceFD == -1 {
-                LoggerProxy.WLog(tag: kLogTag, msg: "警告: 无法打开源文件 \(sourcePath)，跳过。错误: \(String(cString: strerror(errcode)))")
-                throw POSIXFileMergeError.cannotOpenFile(sourcePath, errcode)
-            }
-
-            // 确保在处理完当前源文件后关闭其文件描述符
-            defer {
-                close(sourceFD)
-            }
-
-            do {
-                while true {
-                    // 从源文件读取数据到缓冲区
-                    // read 函数返回实际读取的字节数，-1 表示错误，0 表示文件结束
-                    let bytesRead = read(sourceFD, buffer.baseAddress!, bufferSize)
-
-                    if bytesRead == -1 {
-                        throw POSIXFileMergeError.readError(sourcePath, errno)
-                    }
-
-                    if bytesRead == 0 {
-                        // 读取到文件末尾
-                        break
-                    }
-
-                    // 将缓冲区中的数据写入目标文件
-                    let bytesWritten = write(destFD, buffer.baseAddress!, bytesRead)
-
-                    if bytesWritten == -1 {
-                        throw POSIXFileMergeError.writeError(destinationFilePath, errno)
-                    }
-
-                    if bytesWritten != bytesRead {
-                        // 写入的字节数少于读取的字节数，表示部分写入或错误
-                        throw POSIXFileMergeError.partialWriteError(destinationFilePath, bytesRead, bytesWritten)
-                    }
-                }
-            } catch {
-                LoggerProxy.ELog(tag: kLogTag, msg: "处理文件时发生错误 for \(sourcePath): \(error.localizedDescription)")
-                // 可以选择抛出错误或继续处理下一个文件
-            }
-        }
-
-        LoggerProxy.DLog(tag: kLogTag, msg: "所有文件合并完成到: \(destinationFilePath)")
-    }
-
-    private func checkDiskSpace(requiredSpace: Int64, destinationURL: URL) throws {
-        if DiskSpaceManager.shared.getAvailableDiskSpace(for: destinationURL.path) < requiredSpace {
-            throw DownloadError.insufficientDiskSpace
+        let attributes = try FileManager.default.attributesOfItem(atPath: downloadTask.destinationURL.path)
+        let fileSize = attributes[.size] as? Int64 ?? 0
+        if totalBytes > 0, fileSize != totalBytes {
+            throw DownloadError.fileIOError("目标文件大小错误:\(fileSize), expected:\(totalBytes)")
         }
     }
 
     private func validateChunk(_ chunk: Chunk) throws {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: chunk.filePath.path) else {
-            throw DownloadError.corruptedChunk(chunk.identifier)
-        }
-
-        do {
-            let attributes = try fileManager.attributesOfItem(atPath: chunk.filePath.path)
-            let fileSize = attributes[.size] as? Int64 ?? 0
-            if fileSize != chunk.totalChunkSize {
-                throw DownloadError.corruptedChunk(chunk.identifier)
-            }
-        } catch {
+        if !chunk.isCompleted || chunk.downloadedBytes != chunk.totalChunkSize {
             throw DownloadError.corruptedChunk(chunk.identifier)
         }
     }
