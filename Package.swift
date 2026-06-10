@@ -26,8 +26,8 @@ let package = Package(
         /// 日志代理
         .package(url: "https://github.com/enefry/LoggerProxy.git", from: "2.0.0"),
         /// 并发队列
-        .package(url: "https://github.com/enefry/ConcurrencyCollection.git",from: "0.0.4"),
-        .package(url: "https://github.com/apple/swift-collections.git", exact: "1.1.4"),
+        .package(path: "../ConcurrencyCollection"),
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.3.0"),
         /// 原子类型
         .package(url: "https://github.com/apple/swift-atomics", from: "1.3.0"),
     ],
