@@ -46,6 +46,7 @@ public enum ProtocolType: String {
     case ftp // ftp下载
     case samba = "smb" // samba协议下子
     case magnet // 磁力连接
+    case torrent // torrent 文件
 }
 
 /// 下载状态

@@ -184,6 +184,9 @@ public final class DownloadTask: DownloadTaskProtocol, Codable, @unchecked Senda
 
 extension DownloadTask {
     func downloadProtocol() -> ProtocolType? {
+        if url.isFileURL, url.pathExtension.lowercased() == "torrent" {
+            return .torrent
+        }
         if let scheme = url.scheme?.lowercased() {
             switch scheme {
             case "http", "https":
